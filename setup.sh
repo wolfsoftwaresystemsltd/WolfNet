@@ -129,10 +129,18 @@ echo ""
 echo "Cloning WolfNet repository..."
 
 if [ -d "$INSTALL_DIR" ]; then
-    echo "  Updating existing installation..."
-    cd "$INSTALL_DIR"
-    git fetch origin
-    git reset --hard origin/main
+    CURRENT_REMOTE=$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || echo "")
+    if echo "$CURRENT_REMOTE" | grep -qi "WolfNet"; then
+        echo "  Updating existing installation..."
+        cd "$INSTALL_DIR"
+        git fetch origin
+        git reset --hard origin/main
+    else
+        echo "  Old clone detected — replacing with WolfNet..."
+        rm -rf "$INSTALL_DIR"
+        git clone https://github.com/wolfsoftwaresystemsltd/WolfNet.git "$INSTALL_DIR"
+        cd "$INSTALL_DIR"
+    fi
 else
     git clone https://github.com/wolfsoftwaresystemsltd/WolfNet.git "$INSTALL_DIR"
     cd "$INSTALL_DIR"
