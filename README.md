@@ -88,6 +88,10 @@ sudo systemctl restart wolfnet
 sudo journalctl -u wolfnet -f
 ```
 
+## Documentation
+
+For full documentation, visit **[wolfstack.org](https://wolfstack.org)**.
+
 ## License
 
 [FSL-1.1-Apache-2.0](LICENSE) — Copyright 2024-2026 Wolf Software Systems Ltd.
