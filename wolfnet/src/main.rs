@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 
 
 use wolfnet::config::{Config, NodeStatus};
