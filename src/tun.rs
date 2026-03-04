@@ -3,8 +3,16 @@
 //! Creates and manages a virtual network interface using the Linux TUN driver.
 
 use std::os::unix::io::RawFd;
-use tracing::{info, warn};
+use tracing::warn;
 
+// TUNSETIFF = _IOW('T', 202, c_int)
+// PowerPC encodes ioctl direction bits differently from x86/ARM:
+//   x86/ARM: _IOC_WRITE = 1  → TUNSETIFF = 0x400454ca
+//   PowerPC: _IOC_WRITE = 4  → TUNSETIFF = 0x800454ca
+// Compute at compile time so every architecture gets the correct value.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+const TUNSETIFF: libc::c_ulong = 0x800454ca;
+#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
 const TUNSETIFF: libc::c_ulong = 0x400454ca;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
@@ -58,7 +66,7 @@ impl TunDevice {
             .trim_end_matches('\0')
             .to_string();
 
-        info!("Created TUN device: {}", actual_name);
+
         Ok(Self { fd, name: actual_name })
     }
 
@@ -88,7 +96,7 @@ impl TunDevice {
             return Err(format!("Failed to bring up {}", self.name).into());
         }
 
-        info!("Configured {}: {}/{} mtu {}", self.name, address, subnet, mtu);
+
         Ok(())
     }
 
@@ -140,7 +148,7 @@ impl TunDevice {
 
 impl Drop for TunDevice {
     fn drop(&mut self) {
-        info!("Closing TUN device: {}", self.name);
+
         unsafe { libc::close(self.fd); }
     }
 }
