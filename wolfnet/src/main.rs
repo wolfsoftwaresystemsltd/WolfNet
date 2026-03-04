@@ -899,7 +899,7 @@ fn run_daemon(config_path: &PathBuf) {
                                     }
                                     }
                                     Some(Err(e)) => {
-                                        warn!("Decrypt failed from {} (counter={}): {}", peer_ip, counter, e);
+                                        debug!("Decrypt failed from {} (counter={}): {}", peer_ip, counter, e);
                                     }
                                     None => {
 
