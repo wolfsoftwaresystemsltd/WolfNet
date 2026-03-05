@@ -96,6 +96,23 @@ impl TunDevice {
             return Err(format!("Failed to bring up {}", self.name).into());
         }
 
+        // Tell NetworkManager to ignore this interface — on Fedora/RHEL desktops
+        // NM detects the TUN and tries to manage it, messing with routing metrics
+        // and causing slow/broken connectivity on WiFi and other interfaces.
+        let nm_conf = "/etc/NetworkManager/conf.d/wolfnet.conf";
+        if !std::path::Path::new(nm_conf).exists()
+            && std::path::Path::new("/etc/NetworkManager/conf.d").is_dir()
+        {
+            let _ = std::fs::write(nm_conf,
+                "# WolfNet: prevent NetworkManager from managing the overlay interface.\n\
+                 [keyfile]\n\
+                 unmanaged-devices=interface-name:wolfnet*\n");
+            let _ = std::process::Command::new("nmcli")
+                .args(["general", "reload"]).output();
+        }
+        let _ = std::process::Command::new("nmcli")
+            .args(["device", "set", &self.name, "managed", "no"])
+            .output();
 
         Ok(())
     }
