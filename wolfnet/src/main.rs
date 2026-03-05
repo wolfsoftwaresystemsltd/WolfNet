@@ -817,21 +817,11 @@ fn run_daemon(config_path: &PathBuf) {
                                             // For us — write to TUN
                                             unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, plaintext.len()) };
                                         } else if dest_ip == subnet_bcast || dest_ip == Ipv4Addr::BROADCAST {
-                                            // Broadcast: write to our TUN AND relay to all other peers
+                                            // Broadcast: write to our TUN only — do NOT relay.
+                                            // The original sender already broadcasts to all peers
+                                            // directly. Re-relaying creates an infinite broadcast
+                                            // storm (no TTL/dedup) that saturates the network.
                                             unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, plaintext.len()) };
-                                            for relay_target in peer_manager.all_ips() {
-                                                if relay_target == wolfnet_ip || relay_target == peer_ip { continue; }
-                                                peer_manager.with_peer_by_ip(&relay_target, |dest_peer| {
-                                                    if dest_peer.is_connected() {
-                                                        if let Some(endpoint) = dest_peer.endpoint {
-                                                            if let Ok((ctr, ct)) = dest_peer.encrypt(&plaintext) {
-                                                                let pkt = transport::build_data_packet(&keypair.my_peer_id(), ctr, &ct);
-                                                                let _ = socket.send_to(&pkt, endpoint);
-                                                            }
-                                                        }
-                                                    }
-                                                });
-                                            }
                                         } else {
                                             // Relay: re-encrypt and forward to the destination peer
                                             let forwarded = peer_manager.with_peer_by_ip(&dest_ip, |dest_peer| {
