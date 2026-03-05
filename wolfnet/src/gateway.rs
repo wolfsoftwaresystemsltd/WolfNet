@@ -28,8 +28,18 @@ pub fn enable_gateway(wolfnet_interface: &str, subnet: &str) -> Result<(), Box<d
 
 
 
-    // Enable IP forwarding
-    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+    // Enable forwarding only on the WolfNet and external interfaces — avoid
+    // global ip_forward which turns the machine into a full router and can
+    // cause network-wide slowdowns (especially on low-powered devices like Pis).
+    let _ = std::process::Command::new("sysctl")
+        .args(["-w", &format!("net.ipv4.conf.{}.forwarding=1", wolfnet_interface)]).output();
+    let _ = std::process::Command::new("sysctl")
+        .args(["-w", &format!("net.ipv4.conf.{}.forwarding=1", ext_iface)]).output();
+    // Disable ICMP redirects on these interfaces
+    let _ = std::process::Command::new("sysctl")
+        .args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", wolfnet_interface)]).output();
+    let _ = std::process::Command::new("sysctl")
+        .args(["-w", &format!("net.ipv4.conf.{}.send_redirects=0", ext_iface)]).output();
 
 
     // Add iptables MASQUERADE rule for WolfNet traffic going to the internet
