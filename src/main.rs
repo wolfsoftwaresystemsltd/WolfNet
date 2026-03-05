@@ -471,15 +471,11 @@ fn run_daemon(config_path: &PathBuf) {
         if let Err(e) = wolfnet::gateway::enable_gateway(tun.name(), &subnet) {
             warn!("Gateway setup failed: {}", e);
         }
-    } else if !config.peers.is_empty() {
-        // Not a gateway, but has configured peers — enable IP forwarding
-        // so we can relay packets between LAN-discovered and remote peers
-        if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1") {
-            warn!("Failed to enable IP forwarding: {}", e);
-        } else {
-
-        }
     }
+    // Non-gateway nodes do NOT enable global ip_forward — WolfNet relay is
+    // userspace (TUN → app → UDP) and doesn't need kernel forwarding.
+    // Enabling it on dual-homed machines turns them into routers between
+    // their physical interfaces, which can cripple the network.
 
     // Running flag for graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
