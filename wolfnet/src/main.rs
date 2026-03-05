@@ -722,22 +722,10 @@ fn run_daemon(config_path: &PathBuf) {
                     });
                 }
 
-                // Last resort: broadcast to all connected peers (simple, always works)
-                // The receiving peer that owns the container will deliver it;
-                // others will drop it since it's not for them.
-                for peer_ip in peer_manager.all_ips() {
-                    if peer_ip == wolfnet_ip { continue; }
-                    peer_manager.with_peer_by_ip(&peer_ip, |peer| {
-                        if peer.is_connected() {
-                            if let Some(endpoint) = peer.endpoint {
-                                if let Ok((counter, ciphertext)) = peer.encrypt(&packet) {
-                                    let pkt = transport::build_data_packet(&keypair.my_peer_id(), counter, &ciphertext);
-                                    let _ = socket.send_to(&pkt, endpoint);
-                                }
-                            }
-                        }
-                    });
-                }
+                // Destination peer not found — drop the packet silently.
+                // With autodiscovery, sessions take a few seconds to establish;
+                // flooding unknown packets to all peers saturates the network
+                // (especially on low-powered devices like Raspberry Pis).
 
             }
         }
