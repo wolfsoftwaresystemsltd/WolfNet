@@ -797,10 +797,10 @@ fn run_daemon(config_path: &PathBuf) {
 
                                             peer_manager.add_from_pex(&entries, peer_ip, wolfnet_ip, &keypair);
 
-                                            // Enable IP forwarding if we have multiple peers (we're a relay)
-                                            if peer_manager.count() >= 2 {
-                                                let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
-                                            }
+                                            // WolfNet relay is userspace (TUN → app → UDP) — no
+                                            // kernel ip_forward needed. Enabling it globally turns
+                                            // the machine into a LAN router which can cripple the
+                                            // network on low-powered devices like Raspberry Pis.
                                         }
                                         continue;
                                     }
