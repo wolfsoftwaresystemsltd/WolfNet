@@ -703,16 +703,21 @@ fn run_daemon(config_path: &PathBuf) {
                         let peer_ip = peer_manager.find_ip_by_endpoint_or_id(&src, &peer_id_bytes);
 
                         if let Some(peer_ip) = peer_ip {
-                            // Decrypt in-place: ciphertext in recv_buf[13..n] → plaintext in recv_buf[13..13+pt_len]
+                            // Decrypt in-place + check endpoint in single lock acquisition
                             let decrypt_result = peer_manager.with_peer_by_ip(&peer_ip, |peer| {
-                                peer.decrypt_into(counter, &mut recv_buf[13..13 + ct_len], ct_len)
+                                let result = peer.decrypt_into(counter, &mut recv_buf[13..13 + ct_len], ct_len);
+                                let needs_ep_update = peer.endpoint != Some(src);
+                                (result, needs_ep_update)
                             });
 
-                            match decrypt_result {
-                                Some(Ok(pt_len)) => {
-                                    // Update endpoint if changed (roaming)
-                                    let known_ep = peer_manager.with_peer_by_ip(&peer_ip, |peer| peer.endpoint);
-                                    if known_ep != Some(Some(src)) {
+                            let (dec, needs_ep_update) = match decrypt_result {
+                                Some((r, ep)) => (r, ep),
+                                None => continue,
+                            };
+
+                            match dec {
+                                Ok(pt_len) => {
+                                    if needs_ep_update {
                                         peer_manager.update_endpoint(&peer_ip, src);
                                     }
 
@@ -764,10 +769,9 @@ fn run_daemon(config_path: &PathBuf) {
                                         unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
                                     }
                                 }
-                                Some(Err(e)) => {
+                                Err(e) => {
                                     debug!("Decrypt failed from {} (counter={}): {}", peer_ip, counter, e);
                                 }
-                                None => {}
                             }
                         }
                     }
