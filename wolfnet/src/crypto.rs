@@ -4,7 +4,7 @@
 
 use std::path::Path;
 use x25519_dalek::{PublicKey, StaticSecret};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::{Aead, KeyInit}};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::{Aead, AeadInPlace, KeyInit}};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use sha2::{Sha256, Digest};
 
@@ -128,6 +128,44 @@ impl SessionCipher {
         let ciphertext = self.cipher.encrypt(&nonce, plaintext)
             .map_err(|_| "Encryption failed")?;
         Ok((counter, ciphertext))
+    }
+
+    /// Encrypt in-place: plaintext in buf[..len], appends 16-byte auth tag.
+    /// Returns (counter, total_length) where total_length = len + 16.
+    /// Buffer must have at least len + 16 bytes of space.
+    pub fn encrypt_into(&mut self, buf: &mut [u8], len: usize) -> Result<(u64, usize), Box<dyn std::error::Error + Send + Sync>> {
+        let counter = self.send_counter;
+        self.send_counter += 1;
+        let nonce = self.make_nonce(counter, self.is_low_side);
+        let tag = self.cipher.encrypt_in_place_detached(&nonce, &[], &mut buf[..len])
+            .map_err(|_| "Encryption failed")?;
+        buf[len..len + 16].copy_from_slice(tag.as_slice());
+        Ok((counter, len + 16))
+    }
+
+    /// Decrypt in-place: ciphertext + tag in buf[..len] (last 16 bytes are tag).
+    /// Returns plaintext length (len - 16). Plaintext is left in buf[..plaintext_len].
+    pub fn decrypt_into(&mut self, counter: u64, buf: &mut [u8], len: usize) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let is_likely_restart = counter < 100 && self.recv_counter > 100;
+        if counter <= self.recv_counter && self.recv_counter > 0 && !is_likely_restart {
+            if self.recv_counter - counter > 32 {
+                return Err("Replay detected: stale nonce".into());
+            }
+        }
+        if len < 16 {
+            return Err("Ciphertext too short".into());
+        }
+        let body_len = len - 16;
+        let nonce = self.make_nonce(counter, !self.is_low_side);
+        let mut tag_bytes = [0u8; 16];
+        tag_bytes.copy_from_slice(&buf[body_len..len]);
+        let tag = chacha20poly1305::Tag::from_slice(&tag_bytes);
+        self.cipher.decrypt_in_place_detached(&nonce, &[], &mut buf[..body_len], tag)
+            .map_err(|_| "Decryption failed (invalid key or corrupted data)")?;
+        if counter > self.recv_counter || is_likely_restart {
+            self.recv_counter = counter;
+        }
+        Ok(body_len)
     }
 
     /// Decrypt a packet

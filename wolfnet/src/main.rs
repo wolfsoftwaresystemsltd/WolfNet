@@ -65,6 +65,34 @@ enum Commands {
     },
 }
 
+/// Encrypt plaintext into send_buf and send to peer via UDP. Zero heap allocations.
+/// Copies plaintext into send_buf[13..], encrypts in-place, writes 13-byte header, sends.
+fn encrypt_and_send(
+    send_buf: &mut [u8],
+    plaintext: &[u8],
+    peer: &mut wolfnet::peer::Peer,
+    my_peer_id: &[u8; 4],
+    socket: &UdpSocket,
+) -> bool {
+    let endpoint = match peer.endpoint {
+        Some(ep) => ep,
+        None => return false,
+    };
+    if !peer.is_connected() { return false; }
+    let len = plaintext.len();
+    send_buf[13..13 + len].copy_from_slice(plaintext);
+    match peer.encrypt_into(&mut send_buf[13..], len) {
+        Ok((counter, ct_len)) => {
+            send_buf[0] = transport::PKT_DATA;
+            send_buf[1..5].copy_from_slice(my_peer_id);
+            send_buf[5..13].copy_from_slice(&(counter as u64).to_le_bytes());
+            let _ = socket.send_to(&send_buf[..13 + ct_len], endpoint);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -543,383 +571,217 @@ fn run_daemon(config_path: &PathBuf) {
         });
     }
 
-    // Spawn TUN reader thread — uses poll() to block efficiently in the kernel
-    // instead of busy-polling with sleep, so CPU usage is ~0% when idle.
-    let (tun_tx, tun_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    {
-        let r = running.clone();
-        let tun_fd = tun.raw_fd();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 65536];
-            let mut pfd = libc::pollfd {
-                fd: tun_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            while r.load(Ordering::Relaxed) {
-                // Block until TUN has data (or 100ms timeout to check running flag)
-                let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
-                if ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
-                    // Drain all available packets
-                    loop {
-                        let n = unsafe { libc::read(tun_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-                        if n > 0 {
-                            let _ = tun_tx.send(buf[..n as usize].to_vec());
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // Main event loop
+    // Main event loop — single-threaded, uses poll() on both TUN and UDP fds.
+    // No separate TUN reader thread needed, no mpsc channel, no per-packet Vec allocation.
     info!("WolfNet running — {} ({}) on {}", hostname, wolfnet_ip, tun.name());
-    let mut recv_buf = [0u8; 65536];
+    let tun_fd = tun.raw_fd();
+    let udp_fd = socket.as_raw_fd();
+    let my_peer_id = keypair.my_peer_id();
+
+    // Pre-allocated buffers — all packet processing uses these, zero heap allocations
+    let mut tun_buf = [0u8; 65536];            // TUN reads (plaintext)
+    let mut send_buf = [0u8; 65536 + 29];      // encrypt-in-place + 13-byte header + 16-byte tag
+    let mut recv_buf = [0u8; 65536];            // UDP reads + decrypt-in-place
+
+    let mut pfds = [
+        libc::pollfd { fd: tun_fd, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: udp_fd, events: libc::POLLIN, revents: 0 },
+    ];
     let mut last_handshake = Instant::now();
     let mut last_keepalive = Instant::now();
     let mut last_pex = Instant::now();
     let mut last_dns_resolve = Instant::now();
     let mut last_route_reload = Instant::now();
-    let tun_fd = tun.raw_fd();
-    let udp_fd = socket.as_raw_fd();
-    let mut udp_pfd = libc::pollfd {
-        fd: udp_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
 
     while running.load(Ordering::Relaxed) {
-        // 1. Process packets from TUN (outbound: encrypt and send via UDP)
-        while let Ok(packet) = tun_rx.try_recv() {
-            if let Some(dest_ip) = tun::get_dest_ip(&packet) {
-                // Handle subnet broadcast — send to ALL peers (direct + relayed)
-                // This enables services like WolfDisk autodiscovery across the tunnel
-                let subnet_broadcast = Ipv4Addr::new(
-                    wolfnet_ip.octets()[0],
-                    wolfnet_ip.octets()[1],
-                    wolfnet_ip.octets()[2],
-                    255,
-                );
-                if dest_ip == subnet_broadcast || dest_ip == Ipv4Addr::BROADCAST {
-                    // Collect relay info first (to avoid holding locks while sending)
-                    let mut relay_targets: Vec<(Ipv4Addr, Option<Ipv4Addr>)> = Vec::new();
-                    for ip in peer_manager.all_ips() {
-                        if ip == wolfnet_ip { continue; }
-                        let info = peer_manager.with_peer_by_ip(&ip, |peer| {
-                            (peer.is_connected(), peer.relay_via)
-                        });
-                        if let Some((connected, relay_via)) = info {
-                            if connected {
-                                relay_targets.push((ip, None)); // direct
-                            } else if let Some(relay) = relay_via {
-                                relay_targets.push((ip, Some(relay))); // via relay
-                            }
-                        }
-                    }
-                    // Send to each peer (directly or via relay)
-                    let mut relayed_via: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
-                    for (ip, relay) in &relay_targets {
-                        match relay {
-                            None => {
-                                // Direct send
-                                peer_manager.with_peer_by_ip(ip, |peer| {
-                                    if let Some(endpoint) = peer.endpoint {
-                                        if let Ok((counter, ciphertext)) = peer.encrypt(&packet) {
-                                            let pkt = transport::build_data_packet(&keypair.my_peer_id(), counter, &ciphertext);
-                                            let _ = socket.send_to(&pkt, endpoint);
-                                        }
-                                    }
-                                });
-                            }
-                            Some(relay_ip) => {
-                                // Send via relay — but only once per relay peer
-                                // The relay will re-broadcast to its connected peers
-                                if relayed_via.insert(*relay_ip) {
-                                    peer_manager.with_peer_by_ip(relay_ip, |relay_peer| {
-                                        if relay_peer.is_connected() {
-                                            if let Some(endpoint) = relay_peer.endpoint {
-                                                if let Ok((counter, ciphertext)) = relay_peer.encrypt(&packet) {
-                                                    let pkt = transport::build_data_packet(&keypair.my_peer_id(), counter, &ciphertext);
-                                                    let _ = socket.send_to(&pkt, endpoint);
+        // Block until TUN or UDP has data (50ms timeout for periodic tasks)
+        let poll_ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 50) };
 
-                                                }
-                                            }
-                                        }
+        if poll_ret > 0 {
+        // ── 1. Outbound: TUN → encrypt → UDP ──────────────────────────────
+        if pfds[0].revents & libc::POLLIN != 0 {
+            loop {
+                let n = unsafe { libc::read(tun_fd, tun_buf.as_mut_ptr() as *mut _, tun_buf.len()) };
+                if n <= 0 { break; }
+                let pkt = &tun_buf[..n as usize];
+
+                if let Some(dest_ip) = tun::get_dest_ip(pkt) {
+                    let subnet_broadcast = Ipv4Addr::new(
+                        wolfnet_ip.octets()[0], wolfnet_ip.octets()[1],
+                        wolfnet_ip.octets()[2], 255,
+                    );
+
+                    if dest_ip == subnet_broadcast || dest_ip == Ipv4Addr::BROADCAST {
+                        // Broadcast: encrypt and send to all connected peers (single lock)
+                        let mut relayed_via: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
+                        // Collect targets first (to release lock before sending)
+                        let mut targets: Vec<(Ipv4Addr, Option<Ipv4Addr>)> = Vec::new();
+                        peer_manager.for_each_peer_mut(|ip, peer| {
+                            if ip == wolfnet_ip { return; }
+                            if peer.is_connected() {
+                                targets.push((ip, None));
+                            } else if let Some(relay) = peer.relay_via {
+                                targets.push((ip, Some(relay)));
+                            }
+                        });
+                        for (ip, relay) in &targets {
+                            match relay {
+                                None => {
+                                    peer_manager.with_peer_by_ip(ip, |peer| {
+                                        encrypt_and_send(&mut send_buf, pkt, peer, &my_peer_id, &socket);
                                     });
                                 }
+                                Some(relay_ip) => {
+                                    if relayed_via.insert(*relay_ip) {
+                                        peer_manager.with_peer_by_ip(relay_ip, |relay_peer| {
+                                            encrypt_and_send(&mut send_buf, pkt, relay_peer, &my_peer_id, &socket);
+                                        });
+                                    }
+                                }
                             }
                         }
+                        continue;
                     }
-                    continue;
-                }
 
-                // Try direct peer first
-                let sent = peer_manager.with_peer_by_ip(&dest_ip, |peer| {
-                    if let Some(endpoint) = peer.endpoint {
-                        if peer.is_connected() {
-                            match peer.encrypt(&packet) {
-                                Ok((counter, ciphertext)) => {
-                                    let pkt = transport::build_data_packet(&keypair.my_peer_id(), counter, &ciphertext);
-                                    if let Err(_e) = socket.send_to(&pkt, endpoint) {
+                    // Unicast: try direct → subnet route → relay → gateway
+                    let sent = peer_manager.with_peer_by_ip(&dest_ip, |peer| {
+                        encrypt_and_send(&mut send_buf, pkt, peer, &my_peer_id, &socket)
+                    }).unwrap_or(false);
+                    if sent { continue; }
 
-                                    }
-                                    return true;
-                                }
-                                Err(_e) => { }
-                            }
-                        }
+                    if let Some(host_ip) = peer_manager.find_route(&dest_ip) {
+                        let routed = peer_manager.with_peer_by_ip(&host_ip, |peer| {
+                            encrypt_and_send(&mut send_buf, pkt, peer, &my_peer_id, &socket)
+                        }).unwrap_or(false);
+                        if routed { continue; }
                     }
-                    false
-                });
 
-                if sent.unwrap_or(false) { continue; }
+                    if let Some(relay_ip) = peer_manager.find_relay_for(&dest_ip) {
+                        peer_manager.with_peer_by_ip(&relay_ip, |peer| {
+                            encrypt_and_send(&mut send_buf, pkt, peer, &my_peer_id, &socket);
+                        });
+                        continue;
+                    }
 
-                // Check subnet routes (container/VM IPs routed via a host peer)
-                if let Some(host_ip) = peer_manager.find_route(&dest_ip) {
-                    let routed = peer_manager.with_peer_by_ip(&host_ip, |host_peer| {
-                        if let Some(endpoint) = host_peer.endpoint {
-                            if host_peer.is_connected() {
-                                match host_peer.encrypt(&packet) {
-                                    Ok((counter, ciphertext)) => {
-                                        let pkt = transport::build_data_packet(&keypair.my_peer_id(), counter, &ciphertext);
-                                        let _ = socket.send_to(&pkt, endpoint);
-
-                                        true
-                                    }
-                                    Err(_e) => { false }
-                                }
-                            } else { false }
-                        } else { false }
-                    });
-                    if routed.unwrap_or(false) { continue; }
+                    if let Some(gw_ip) = peer_manager.find_gateway() {
+                        peer_manager.with_peer_by_ip(&gw_ip, |peer| {
+                            encrypt_and_send(&mut send_buf, pkt, peer, &my_peer_id, &socket);
+                        });
+                    }
                 }
-
-                // Not directly connected — try relay via PEX-learned route
-                let relay_ip = peer_manager.find_relay_for(&dest_ip);
-                if let Some(relay_ip) = relay_ip {
-                    peer_manager.with_peer_by_ip(&relay_ip, |relay_peer| {
-                        if let Some(endpoint) = relay_peer.endpoint {
-                            match relay_peer.encrypt(&packet) {
-                                Ok((counter, ciphertext)) => {
-                                    let pkt = transport::build_data_packet(&keypair.my_peer_id(), counter, &ciphertext);
-                                    if let Err(_e) = socket.send_to(&pkt, endpoint) {
-
-                                    } else {
-
-                                    }
-                                }
-                                Err(_e) => {}
-                            }
-                        } else {
-
-                        }
-                    });
-                    continue;
-                }
-
-                // Fall back to gateway routing
-                if let Some(gw_ip) = peer_manager.find_gateway() {
-                    peer_manager.with_peer_by_ip(&gw_ip, |gw_peer| {
-                        if let Some(endpoint) = gw_peer.endpoint {
-                            match gw_peer.encrypt(&packet) {
-                                Ok((counter, ciphertext)) => {
-                                    let pkt = transport::build_data_packet(&keypair.my_peer_id(), counter, &ciphertext);
-                                    if let Err(_e) = socket.send_to(&pkt, endpoint) {
-
-                                    }
-                                }
-                                Err(_e) => {}
-                            }
-                        }
-                    });
-                }
-
-                // Destination peer not found — drop the packet silently.
-                // With autodiscovery, sessions take a few seconds to establish;
-                // flooding unknown packets to all peers saturates the network
-                // (especially on low-powered devices like Raspberry Pis).
-
             }
         }
 
-        // 2. Process packets from UDP (inbound: decrypt and write to TUN)
-        // poll() blocks efficiently in the kernel — 50ms timeout so periodic tasks still run
-        let poll_ret = unsafe { libc::poll(&mut udp_pfd, 1, 50) };
-        if poll_ret <= 0 {
-            // Timeout or error — skip to periodic checks
-        } else if let Ok((n, src)) = socket.recv_from(&mut recv_buf) {
-            if n > 0 {
-                let data = &recv_buf[..n];
-                match data[0] {
+        // ── 2. Inbound: UDP → decrypt → TUN ──────────────────────────────
+        if pfds[1].revents & libc::POLLIN != 0 {
+            loop {
+                let (n, src) = match socket.recv_from(&mut recv_buf) {
+                    Ok((n, src)) if n > 0 => (n, src),
+                    _ => break,
+                };
+
+                match recv_buf[0] {
                     transport::PKT_HANDSHAKE => {
+                        let data = &recv_buf[..n];
                         if let Some((pub_key, peer_ip, _peer_port, is_gw, peer_hostname)) = transport::parse_handshake(data) {
-                            // Use the actual UDP source address — NOT the advertised port.
-                            // Over NAT, the source port differs from listen_port.
                             let endpoint = src;
                             peer_manager.update_from_discovery(&pub_key, endpoint, peer_ip, &peer_hostname, is_gw);
                             peer_manager.with_peer_by_ip(&peer_ip, |peer| {
-                                // Always re-establish session on handshake.
-                                // A handshake means the peer is (re)connecting — their send
-                                // counter resets to 0, so we must reset our recv counter too.
-                                // Without this, a peer restart causes all their new packets
-                                // to be rejected as "replay" because the old recv_counter
-                                // is higher than their new send counter.
                                 peer.establish_session(&keypair.secret, &keypair.public);
                                 peer.last_seen = Some(Instant::now());
                             });
-                            // Send handshake back
                             let reply = transport::build_handshake(&keypair, wolfnet_ip, config.network.listen_port, &hostname, is_gateway);
                             let _ = socket.send_to(&reply, src);
                         }
                     }
-                    transport::PKT_DATA => {
-                        if let Some((peer_id_bytes, counter, ciphertext)) = transport::parse_data_packet(data) {
-                            // Find peer by source address, or fall back to peer_id (endpoint roaming)
-                            let peer_ip = peer_manager.find_ip_by_endpoint(&src)
-                                .or_else(|| {
-                                    // Peer's IP may have changed — try to find by peer_id
-                                    peer_manager.find_ip_by_id(&peer_id_bytes)
-                                });
+                    transport::PKT_DATA if n > 13 => {
+                        let mut peer_id_bytes = [0u8; 4];
+                        peer_id_bytes.copy_from_slice(&recv_buf[1..5]);
+                        let counter = u64::from_le_bytes(recv_buf[5..13].try_into().unwrap());
+                        let ct_len = n - 13;
 
-                            if let Some(peer_ip) = peer_ip {
-                                let decrypted = peer_manager.with_peer_by_ip(&peer_ip, |peer| {
-                                    peer.decrypt(counter, ciphertext)
-                                });
-                                match decrypted {
-                                    Some(Ok(plaintext)) => {
-                                    // Update endpoint if it changed (roaming)
-                                    let known_endpoint = peer_manager.with_peer_by_ip(&peer_ip, |peer| peer.endpoint);
-                                    if known_endpoint != Some(Some(src)) {
-    
+                        let peer_ip = peer_manager.find_ip_by_endpoint_or_id(&src, &peer_id_bytes);
+
+                        if let Some(peer_ip) = peer_ip {
+                            // Decrypt in-place: ciphertext in recv_buf[13..n] → plaintext in recv_buf[13..13+pt_len]
+                            let decrypt_result = peer_manager.with_peer_by_ip(&peer_ip, |peer| {
+                                peer.decrypt_into(counter, &mut recv_buf[13..13 + ct_len], ct_len)
+                            });
+
+                            match decrypt_result {
+                                Some(Ok(pt_len)) => {
+                                    // Update endpoint if changed (roaming)
+                                    let known_ep = peer_manager.with_peer_by_ip(&peer_ip, |peer| peer.endpoint);
+                                    if known_ep != Some(Some(src)) {
                                         peer_manager.update_endpoint(&peer_ip, src);
                                     }
 
-                                    // Check if this is a PEX message
-                                    if plaintext.len() > 1 && plaintext[0] == transport::PKT_PEER_EXCHANGE {
-                                        if let Some(entries) = transport::parse_peer_exchange(&plaintext) {
+                                    let plaintext = &recv_buf[13..13 + pt_len];
 
+                                    // PEX message
+                                    if pt_len > 1 && plaintext[0] == transport::PKT_PEER_EXCHANGE {
+                                        if let Some(entries) = transport::parse_peer_exchange(plaintext) {
                                             peer_manager.add_from_pex(&entries, peer_ip, wolfnet_ip, &keypair);
-
-                                            // WolfNet relay is userspace (TUN → app → UDP) — no
-                                            // kernel ip_forward needed. Enabling it globally turns
-                                            // the machine into a LAN router which can cripple the
-                                            // network on low-powered devices like Raspberry Pis.
                                         }
                                         continue;
                                     }
 
-                                    // If a relayed handshake arrives inside an encrypted data packet,
-                                    // just ignore it — handshakes should only be processed when they
-                                    // arrive as raw UDP packets (handled in the PKT_HANDSHAKE case above).
-                                    // Processing them here corrupts endpoint info and causes session storms.
-                                    if plaintext.len() > 1 && plaintext[0] == transport::PKT_HANDSHAKE {
-
+                                    // Relayed handshake — ignore
+                                    if pt_len > 1 && plaintext[0] == transport::PKT_HANDSHAKE {
                                         continue;
                                     }
 
-
-                                    // Check if this packet is for us or needs relaying
-                                    if let Some(dest_ip) = tun::get_dest_ip(&plaintext) {
-                                        // Compute subnet broadcast address
+                                    // Route: for us, broadcast, or relay
+                                    if let Some(dest_ip) = tun::get_dest_ip(plaintext) {
                                         let subnet_bcast = Ipv4Addr::new(
-                                            wolfnet_ip.octets()[0],
-                                            wolfnet_ip.octets()[1],
-                                            wolfnet_ip.octets()[2],
-                                            255,
+                                            wolfnet_ip.octets()[0], wolfnet_ip.octets()[1],
+                                            wolfnet_ip.octets()[2], 255,
                                         );
 
-                                        if dest_ip == wolfnet_ip {
-                                            // For us — write to TUN
-                                            unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, plaintext.len()) };
-                                        } else if dest_ip == subnet_bcast || dest_ip == Ipv4Addr::BROADCAST {
-                                            // Broadcast: write to our TUN only — do NOT relay.
-                                            // The original sender already broadcasts to all peers
-                                            // directly. Re-relaying creates an infinite broadcast
-                                            // storm (no TTL/dedup) that saturates the network.
-                                            unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, plaintext.len()) };
+                                        if dest_ip == wolfnet_ip || dest_ip == subnet_bcast || dest_ip == Ipv4Addr::BROADCAST {
+                                            unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
                                         } else {
-                                            // Relay: re-encrypt and forward to the destination peer
+                                            // Relay: re-encrypt for destination peer
                                             let forwarded = peer_manager.with_peer_by_ip(&dest_ip, |dest_peer| {
-                                                if let Some(endpoint) = dest_peer.endpoint {
-                                                    match dest_peer.encrypt(&plaintext) {
-                                                        Ok((ctr, ct)) => {
-                                                            let pkt = transport::build_data_packet(&keypair.my_peer_id(), ctr, &ct);
-                                                            let _ = socket.send_to(&pkt, endpoint);
+                                                encrypt_and_send(&mut send_buf, plaintext, dest_peer, &my_peer_id, &socket)
+                                            }).unwrap_or(false);
 
-                                                            true
-                                                        }
-                                                        Err(_e) => {
-
-                                                            false
-                                                        }
-                                                    }
-                                                } else {
-
-                                                    false
-                                                }
-                                            });
-                                            if !forwarded.unwrap_or(false) {
-                                                // Check subnet routes — if the container is on us, write to TUN
-                                                // If it's on another peer, forward via that peer
+                                            if !forwarded {
                                                 if let Some(host_ip) = peer_manager.find_route(&dest_ip) {
                                                     if host_ip == wolfnet_ip {
-                                                        // Container is on this node — write to TUN for kernel routing to bridge
-                                                        unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, plaintext.len()) };
+                                                        unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
                                                     } else {
-                                                        // Forward to the host peer
                                                         peer_manager.with_peer_by_ip(&host_ip, |host_peer| {
-                                                            if let Some(endpoint) = host_peer.endpoint {
-                                                                if let Ok((ctr, ct)) = host_peer.encrypt(&plaintext) {
-                                                                    let pkt = transport::build_data_packet(&keypair.my_peer_id(), ctr, &ct);
-                                                                    let _ = socket.send_to(&pkt, endpoint);
-
-                                                                }
-                                                            }
+                                                            encrypt_and_send(&mut send_buf, plaintext, host_peer, &my_peer_id, &socket);
                                                         });
                                                     }
                                                 } else {
-                                                    // Destination unknown — write to TUN for kernel routing
-                                                    unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, plaintext.len()) };
+                                                    unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
                                                 }
                                             }
                                         }
                                     } else {
-                                        unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, plaintext.len()) };
-                                    }
-                                    }
-                                    Some(Err(e)) => {
-                                        debug!("Decrypt failed from {} (counter={}): {}", peer_ip, counter, e);
-                                    }
-                                    None => {
-
+                                        unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
                                     }
                                 }
-                            } else {
-
+                                Some(Err(e)) => {
+                                    debug!("Decrypt failed from {} (counter={}): {}", peer_ip, counter, e);
+                                }
+                                None => {}
                             }
                         }
                     }
-                    transport::PKT_KEEPALIVE => {
-                        let mut peer_ip_opt = peer_manager.find_ip_by_endpoint(&src);
-                        
-                        // If not found by endpoint, try extracting Peer ID from body
-                        // This handles cases where a peer's NAT mapping changed (rebind) or
-                        // the gateway restarted and lost its ephemeral endpoint mapping.
-                        if peer_ip_opt.is_none() && data.len() >= 5 {
-                            let mut peer_id = [0u8; 4];
-                            peer_id.copy_from_slice(&data[1..5]);
-                            peer_ip_opt = peer_manager.find_ip_by_id(&peer_id);
-                            
-                            if let Some(ip) = peer_ip_opt {
+                    transport::PKT_KEEPALIVE if n >= 5 => {
+                        let mut peer_id = [0u8; 4];
+                        peer_id.copy_from_slice(&recv_buf[1..5]);
+                        let peer_ip = peer_manager.find_ip_by_endpoint_or_id(&src, &peer_id);
 
+                        if let Some(ip) = peer_ip {
+                            // Update endpoint if found by ID (NAT rebind)
+                            if peer_manager.find_ip_by_endpoint(&src).is_none() {
                                 peer_manager.update_endpoint(&ip, src);
                             }
-                        }
-
-                        if let Some(peer_ip) = peer_ip_opt {
-                            peer_manager.with_peer_by_ip(&peer_ip, |peer| {
+                            peer_manager.with_peer_by_ip(&ip, |peer| {
                                 peer.last_seen = Some(Instant::now());
                             });
                         }
@@ -928,6 +790,7 @@ fn run_daemon(config_path: &PathBuf) {
                 }
             }
         }
+        } // poll_ret > 0
 
         // 3. Periodic handshakes (every 10s)
         if last_handshake.elapsed() > Duration::from_secs(10) {
