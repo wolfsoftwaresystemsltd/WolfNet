@@ -96,6 +96,23 @@ impl Peer {
         self.last_seen = Some(Instant::now());
         Ok(result)
     }
+
+    /// Encrypt in-place: plaintext in buf[..len], appends 16-byte tag. Zero allocations.
+    pub fn encrypt_into(&mut self, buf: &mut [u8], len: usize) -> Result<(u64, usize), Box<dyn std::error::Error + Send + Sync>> {
+        let cipher = self.cipher.as_mut().ok_or("No session established")?;
+        let result = cipher.encrypt_into(buf, len)?;
+        self.tx_bytes += len as u64;
+        Ok(result)
+    }
+
+    /// Decrypt in-place: ciphertext+tag in buf[..len]. Zero allocations.
+    pub fn decrypt_into(&mut self, counter: u64, buf: &mut [u8], len: usize) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let cipher = self.cipher.as_mut().ok_or("No session established")?;
+        let pt_len = cipher.decrypt_into(counter, buf, len)?;
+        self.rx_bytes += pt_len as u64;
+        self.last_seen = Some(Instant::now());
+        Ok(pt_len)
+    }
 }
 
 /// Manages all known peers
@@ -148,6 +165,23 @@ impl PeerManager {
     /// Find peer by peer ID
     pub fn find_ip_by_id(&self, id: &[u8; 4]) -> Option<Ipv4Addr> {
         self.id_to_ip.read().unwrap().get(id).copied()
+    }
+
+    /// Find peer by endpoint first, then fall back to peer ID (single lookup path)
+    pub fn find_ip_by_endpoint_or_id(&self, addr: &SocketAddr, id: &[u8; 4]) -> Option<Ipv4Addr> {
+        if let Some(ip) = self.endpoint_to_ip.read().unwrap().get(addr).copied() {
+            return Some(ip);
+        }
+        self.id_to_ip.read().unwrap().get(id).copied()
+    }
+
+    /// Iterate all peers under a single write lock — avoids N separate lock acquisitions
+    pub fn for_each_peer_mut<F>(&self, mut f: F)
+    where F: FnMut(Ipv4Addr, &mut Peer) {
+        let mut peers = self.peers_by_ip.write().unwrap();
+        for (&ip, peer) in peers.iter_mut() {
+            f(ip, peer);
+        }
     }
 
     /// Update a peer's endpoint (e.g. after receiving a packet from a new address)
