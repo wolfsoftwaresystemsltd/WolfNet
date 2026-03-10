@@ -124,25 +124,17 @@ fi
 echo "✓ Using cargo: $(command -v cargo)"
 
 # Clone or update repository
-INSTALL_DIR="/opt/wolfnet-src"
+INSTALL_DIR="/opt/wolfscale-src"
 echo ""
-echo "Cloning WolfNet repository..."
+echo "Cloning WolfScale repository..."
 
 if [ -d "$INSTALL_DIR" ]; then
-    CURRENT_REMOTE=$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || echo "")
-    if echo "$CURRENT_REMOTE" | grep -qi "WolfNet"; then
-        echo "  Updating existing installation..."
-        cd "$INSTALL_DIR"
-        git fetch origin
-        git reset --hard origin/main
-    else
-        echo "  Old clone detected — replacing with WolfNet..."
-        rm -rf "$INSTALL_DIR"
-        git clone https://github.com/wolfsoftwaresystemsltd/WolfNet.git "$INSTALL_DIR"
-        cd "$INSTALL_DIR"
-    fi
+    echo "  Updating existing installation..."
+    cd "$INSTALL_DIR"
+    git fetch origin
+    git reset --hard origin/main
 else
-    git clone https://github.com/wolfsoftwaresystemsltd/WolfNet.git "$INSTALL_DIR"
+    git clone https://github.com/wolfsoftwaresystemsltd/WolfScale.git "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 fi
 
@@ -151,12 +143,12 @@ echo "✓ Repository cloned to $INSTALL_DIR"
 # Build WolfNet (as the real user if possible, to use their cargo)
 echo ""
 echo "Building WolfNet (this may take a few minutes)..."
-cd "$INSTALL_DIR"
+cd "$INSTALL_DIR/wolfnet"
 
 if [ "$REAL_USER" != "root" ] && [ -f "$REAL_HOME/.cargo/bin/cargo" ]; then
     # Build as the real user so cargo uses their toolchain
     chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
-    su - "$REAL_USER" -c "cd $INSTALL_DIR && $REAL_HOME/.cargo/bin/cargo build --release"
+    su - "$REAL_USER" -c "cd $INSTALL_DIR/wolfnet && $REAL_HOME/.cargo/bin/cargo build --release"
 else
     cargo build --release
 fi
@@ -183,13 +175,13 @@ if [ -f "/usr/local/bin/wolfnet" ]; then
 else
     echo "Installing WolfNet..."
 fi
-cp "$INSTALL_DIR/target/release/wolfnet" /usr/local/bin/wolfnet
+cp "$INSTALL_DIR/wolfnet/target/release/wolfnet" /usr/local/bin/wolfnet
 chmod +x /usr/local/bin/wolfnet
 echo "✓ wolfnet installed to /usr/local/bin/wolfnet"
 
 # Install wolfnetctl if it exists
-if [ -f "$INSTALL_DIR/target/release/wolfnetctl" ]; then
-    cp "$INSTALL_DIR/target/release/wolfnetctl" /usr/local/bin/wolfnetctl
+if [ -f "$INSTALL_DIR/wolfnet/target/release/wolfnetctl" ]; then
+    cp "$INSTALL_DIR/wolfnet/target/release/wolfnetctl" /usr/local/bin/wolfnetctl
     chmod +x /usr/local/bin/wolfnetctl
     echo "✓ wolfnetctl installed to /usr/local/bin/wolfnetctl"
 fi
