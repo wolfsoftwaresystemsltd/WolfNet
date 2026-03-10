@@ -12,9 +12,9 @@ include 'includes/head.php';
 
             <!-- Overview -->
             <div class="content-section">
-                <h2>Overview</h2>
+                <h1>Overview</h1>
                 <p>WolfStack&rsquo;s Backup &amp; Restore system lets you create on-demand or scheduled backups of everything on your server &mdash; Docker containers, LXC containers, KVM virtual machines, and WolfStack configuration files. Backups can be stored locally, on S3-compatible object storage, on a remote WolfStack node, on a WolfDisk mount, or on a Proxmox Backup Server (PBS).</p>
-                <p>Access backups from the WolfStack dashboard under <strong>Datacenter &rarr; Backup</strong>.</p>
+                <p>Per-node backups are accessed under each node &rarr; <strong>💾 Backups</strong>. For a cluster-wide view, see <a href="#cluster-backups">Cluster Backups</a> under your cluster name in the sidebar.</p>
 
                 <h3>What Can Be Backed Up</h3>
                 <div class="table-wrapper">
@@ -122,6 +122,58 @@ include 'includes/head.php';
                     <li>Click <strong>Save</strong>. WolfStack checks for due schedules every 60 seconds.</li>
                 </ol>
                 <div class="info-box"><strong>Retention example:</strong> A daily schedule with retention set to 7 keeps one week of backups. On the 8th run, the oldest backup is automatically deleted.</div>
+            </div>
+
+            <!-- Cluster Backups -->
+            <div class="content-section" id="cluster-backups">
+                <h2>Cluster Backups</h2>
+                <p>Cluster Backups gives you a single aggregated view of all backups across every node in a cluster, plus the ability to push backup schedules and PBS configuration to multiple nodes at once &mdash; even across different clusters.</p>
+                <p>Access it from the sidebar under your cluster name &rarr; <strong>💾 Backups</strong> (next to WolfRun and Status Pages).</p>
+
+                <h3>Aggregated Overview</h3>
+                <p>The cluster backups page shows:</p>
+                <ul>
+                    <li><strong>Summary stats</strong> &mdash; total backups, schedules, nodes, and how many nodes have PBS connected</li>
+                    <li><strong>Backup History (All Nodes)</strong> &mdash; a combined table of every backup from every online node in the cluster, sorted newest first, with a <strong>Node</strong> column showing which server each backup lives on</li>
+                    <li><strong>Schedules (All Nodes)</strong> &mdash; all active and disabled schedules across the cluster in one view</li>
+                </ul>
+
+                <h3>Creating a Cluster-Wide Schedule</h3>
+                <p>Instead of configuring a backup schedule on each node individually, you can define one schedule and push it to multiple nodes at once:</p>
+                <ol>
+                    <li>Go to your cluster &rarr; <strong>💾 Backups</strong> &rarr; <strong>Create Cluster Schedule</strong>.</li>
+                    <li>Fill in the schedule settings (name, frequency, time, retention, storage).</li>
+                    <li>Choose what to back up:
+                        <ul>
+                            <li><strong>Everything on each node</strong> &mdash; each node backs up all its Docker containers, LXC containers, VMs, and config automatically.</li>
+                            <li><strong>Select specific targets</strong> &mdash; click <strong>Load Targets from Nodes</strong> to fetch the available backup targets from each node. Targets are grouped by node with individual checkboxes, so you can exclude specific containers or VMs from certain nodes. Each node also has an <strong>All</strong> toggle.</li>
+                        </ul>
+                    </li>
+                    <li>In the <strong>Target Nodes</strong> section, tick which nodes should receive the schedule. Nodes are sorted by cluster then hostname.</li>
+                    <li>Click <strong>Push Schedule to Selected Nodes</strong>. WolfStack creates the schedule on each selected node in parallel.</li>
+                </ol>
+                <div class="info-box"><strong>Tip:</strong> When all targets on a node are selected, WolfStack sends <code>backup_all: true</code> to that node. This means any new containers or VMs added later are automatically included. If you deselect even one target, only the explicitly checked items are backed up.</div>
+
+                <h3>Pushing PBS Configuration to All Nodes</h3>
+                <p>If you use Proxmox Backup Server, you can configure it once and push the credentials to every WolfStack node &mdash; even nodes in different clusters:</p>
+                <ol>
+                    <li>In the <strong>Proxmox Backup Server &mdash; Push Config</strong> card, enter your PBS details (server, datastore, user, password or API token, fingerprint, namespace).</li>
+                    <li>In the <strong>Target Nodes</strong> section, select which nodes to push to. All online WolfStack nodes across every cluster are listed.</li>
+                    <li>Click <strong>Push PBS Config to Selected Nodes</strong>.</li>
+                </ol>
+                <p>Each node receives the full PBS configuration including passwords and secrets, so it can immediately start sending backups to PBS.</p>
+
+                <h3>Pulling PBS Configuration from a Node</h3>
+                <p>If PBS is already configured on one of your nodes, you can pull that configuration and use it to push to other nodes:</p>
+                <ol>
+                    <li>Click <strong>Pull Config from a Node</strong>.</li>
+                    <li>A dialog shows every online WolfStack node and whether it has PBS configured (with the server and datastore name).</li>
+                    <li>Click <strong>Pull</strong> next to the node you want to copy from. The full config (including passwords and token secrets) is fetched and populated into the form.</li>
+                    <li>You can then push it to all other nodes.</li>
+                </ol>
+
+                <h3>Per-Node PBS Status</h3>
+                <p>The cluster backups page shows the PBS connection status of every node in your cluster at a glance &mdash; whether the client is installed, whether it can reach the PBS server, and how many snapshots are available. This makes it easy to spot nodes that need attention.</p>
             </div>
 
             <!-- Connecting to Proxmox Backup Server -->
