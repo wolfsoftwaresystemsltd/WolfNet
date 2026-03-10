@@ -558,9 +558,9 @@ fn run_daemon(config_path: &PathBuf) {
                     if err.kind() != std::io::ErrorKind::WouldBlock {
 
                     }
-                    std::thread::sleep(Duration::from_micros(100));
+                    std::thread::sleep(Duration::from_millis(1));
                 } else {
-                    std::thread::sleep(Duration::from_micros(100));
+                    std::thread::sleep(Duration::from_millis(1));
                 }
             }
         });
@@ -577,8 +577,11 @@ fn run_daemon(config_path: &PathBuf) {
     let tun_fd = tun.raw_fd();
 
     while running.load(Ordering::Relaxed) {
+        let mut did_work = false;
+
         // 1. Process packets from TUN (outbound: encrypt and send via UDP)
         while let Ok(packet) = tun_rx.try_recv() {
+            did_work = true;
             if let Some(dest_ip) = tun::get_dest_ip(&packet) {
                 // Handle subnet broadcast — send to ALL peers (direct + relayed)
                 // This enables services like WolfDisk autodiscovery across the tunnel
@@ -733,6 +736,7 @@ fn run_daemon(config_path: &PathBuf) {
         // 2. Process packets from UDP (inbound: decrypt and write to TUN)
         match socket.recv_from(&mut recv_buf) {
             Ok((n, src)) => {
+                did_work = true;
                 if n == 0 { continue; }
                 let data = &recv_buf[..n];
                 match data[0] {
@@ -1029,6 +1033,13 @@ fn run_daemon(config_path: &PathBuf) {
                 }
                 Err(e) => warn!("Config reload failed: {}", e),
             }
+        }
+
+        // Sleep briefly when idle to prevent CPU spin.
+        // The UDP socket has a 50ms read timeout, but when there are
+        // bursts of TUN packets with no UDP replies, the loop can spin.
+        if !did_work {
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
