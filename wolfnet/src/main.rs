@@ -7,6 +7,7 @@
 //! automatically gives you access to all its peers.
 
 use std::net::{UdpSocket, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::unix::io::AsRawFd;
 use std::io::{Read, Write};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
@@ -427,7 +428,7 @@ fn run_daemon(config_path: &PathBuf) {
         error!("Failed to bind UDP {}: {}", bind_addr, e);
         std::process::exit(1);
     }));
-    socket.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    socket.set_nonblocking(true).expect("Failed to set UDP socket non-blocking");
     info!("Listening on UDP {}", bind_addr);
 
     // Initialize peer manager and add configured peers
@@ -542,25 +543,32 @@ fn run_daemon(config_path: &PathBuf) {
         });
     }
 
-    // Spawn TUN reader thread
+    // Spawn TUN reader thread — uses poll() to block efficiently in the kernel
+    // instead of busy-polling with sleep, so CPU usage is ~0% when idle.
     let (tun_tx, tun_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     {
         let r = running.clone();
         let tun_fd = tun.raw_fd();
         std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
+            let mut pfd = libc::pollfd {
+                fd: tun_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             while r.load(Ordering::Relaxed) {
-                let n = unsafe { libc::read(tun_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n > 0 {
-                    let _ = tun_tx.send(buf[..n as usize].to_vec());
-                } else if n < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() != std::io::ErrorKind::WouldBlock {
-
+                // Block until TUN has data (or 100ms timeout to check running flag)
+                let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+                if ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
+                    // Drain all available packets
+                    loop {
+                        let n = unsafe { libc::read(tun_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                        if n > 0 {
+                            let _ = tun_tx.send(buf[..n as usize].to_vec());
+                        } else {
+                            break;
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(1));
-                } else {
-                    std::thread::sleep(Duration::from_millis(1));
                 }
             }
         });
@@ -575,13 +583,16 @@ fn run_daemon(config_path: &PathBuf) {
     let mut last_dns_resolve = Instant::now();
     let mut last_route_reload = Instant::now();
     let tun_fd = tun.raw_fd();
+    let udp_fd = socket.as_raw_fd();
+    let mut udp_pfd = libc::pollfd {
+        fd: udp_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
 
     while running.load(Ordering::Relaxed) {
-        let mut did_work = false;
-
         // 1. Process packets from TUN (outbound: encrypt and send via UDP)
         while let Ok(packet) = tun_rx.try_recv() {
-            did_work = true;
             if let Some(dest_ip) = tun::get_dest_ip(&packet) {
                 // Handle subnet broadcast — send to ALL peers (direct + relayed)
                 // This enables services like WolfDisk autodiscovery across the tunnel
@@ -734,10 +745,12 @@ fn run_daemon(config_path: &PathBuf) {
         }
 
         // 2. Process packets from UDP (inbound: decrypt and write to TUN)
-        match socket.recv_from(&mut recv_buf) {
-            Ok((n, src)) => {
-                did_work = true;
-                if n == 0 { continue; }
+        // poll() blocks efficiently in the kernel — 50ms timeout so periodic tasks still run
+        let poll_ret = unsafe { libc::poll(&mut udp_pfd, 1, 50) };
+        if poll_ret <= 0 {
+            // Timeout or error — skip to periodic checks
+        } else if let Ok((n, src)) = socket.recv_from(&mut recv_buf) {
+            if n > 0 {
                 let data = &recv_buf[..n];
                 match data[0] {
                     transport::PKT_HANDSHAKE => {
@@ -914,8 +927,6 @@ fn run_daemon(config_path: &PathBuf) {
                     _ => {}
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_e) => {}
         }
 
         // 3. Periodic handshakes (every 10s)
@@ -1035,12 +1046,6 @@ fn run_daemon(config_path: &PathBuf) {
             }
         }
 
-        // Sleep briefly when idle to prevent CPU spin.
-        // The UDP socket has a 50ms read timeout, but when there are
-        // bursts of TUN packets with no UDP replies, the loop can spin.
-        if !did_work {
-            std::thread::sleep(Duration::from_millis(1));
-        }
     }
 
     // Cleanup
