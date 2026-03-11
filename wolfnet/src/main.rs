@@ -587,6 +587,9 @@ fn run_daemon(config_path: &PathBuf) {
         libc::pollfd { fd: tun_fd, events: libc::POLLIN, revents: 0 },
         libc::pollfd { fd: udp_fd, events: libc::POLLIN, revents: 0 },
     ];
+    // Pre-allocated broadcast buffers — reused every broadcast, zero per-packet heap allocs
+    let mut broadcast_targets: Vec<(Ipv4Addr, Option<Ipv4Addr>)> = Vec::with_capacity(64);
+    let mut broadcast_relayed: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::with_capacity(64);
     let mut last_handshake = Instant::now();
     let mut last_keepalive = Instant::now();
     let mut last_pex = Instant::now();
@@ -613,18 +616,17 @@ fn run_daemon(config_path: &PathBuf) {
 
                     if dest_ip == subnet_broadcast || dest_ip == Ipv4Addr::BROADCAST {
                         // Broadcast: encrypt and send to all connected peers (single lock)
-                        let mut relayed_via: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
-                        // Collect targets first (to release lock before sending)
-                        let mut targets: Vec<(Ipv4Addr, Option<Ipv4Addr>)> = Vec::new();
+                        broadcast_relayed.clear();
+                        broadcast_targets.clear();
                         peer_manager.for_each_peer_mut(|ip, peer| {
                             if ip == wolfnet_ip { return; }
                             if peer.is_connected() {
-                                targets.push((ip, None));
+                                broadcast_targets.push((ip, None));
                             } else if let Some(relay) = peer.relay_via {
-                                targets.push((ip, Some(relay)));
+                                broadcast_targets.push((ip, Some(relay)));
                             }
                         });
-                        for (ip, relay) in &targets {
+                        for (ip, relay) in &broadcast_targets {
                             match relay {
                                 None => {
                                     peer_manager.with_peer_by_ip(ip, |peer| {
@@ -632,7 +634,7 @@ fn run_daemon(config_path: &PathBuf) {
                                     });
                                 }
                                 Some(relay_ip) => {
-                                    if relayed_via.insert(*relay_ip) {
+                                    if broadcast_relayed.insert(*relay_ip) {
                                         peer_manager.with_peer_by_ip(relay_ip, |relay_peer| {
                                             encrypt_and_send(&mut send_buf, pkt, relay_peer, &my_peer_id, &socket);
                                         });
