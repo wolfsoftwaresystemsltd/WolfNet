@@ -1,6 +1,6 @@
 [package]
 name = "wolfnet"
-version = "0.5.11"
+version = "0.5.12"
 edition = "2021"
 authors = ["Wolf Software Systems Ltd"]
 description = "Secure private mesh networking over the internet"
