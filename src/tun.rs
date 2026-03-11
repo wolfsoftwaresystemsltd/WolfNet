@@ -96,6 +96,18 @@ impl TunDevice {
             return Err(format!("Failed to bring up {}", self.name).into());
         }
 
+        // Disable IPv6 on the TUN — WolfNet is IPv4-only and the kernel pushes
+        // IPv6 multicast (neighbor discovery, IGMP) into the TUN fd, wasting CPU
+        let _ = std::fs::write(
+            format!("/proc/sys/net/ipv6/conf/{}/disable_ipv6", self.name),
+            "1",
+        );
+
+        // Disable multicast on the interface — prevents IGMP traffic through the TUN
+        let _ = std::process::Command::new("ip")
+            .args(["link", "set", "dev", &self.name, "multicast", "off"])
+            .status();
+
         // Tell NetworkManager to ignore this interface — on Fedora/RHEL desktops
         // NM detects the TUN and tries to manage it, messing with routing metrics
         // and causing slow/broken connectivity on WiFi and other interfaces.
