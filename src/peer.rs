@@ -258,6 +258,13 @@ impl PeerManager {
         }
         
         // Entirely new peer discovered on LAN
+        // If a different-key peer already holds this IP, clean up its stale mappings
+        if let Some(old_peer) = peers.remove(&wolfnet_ip) {
+            if let Some(old_ep) = old_peer.endpoint {
+                self.endpoint_to_ip.write().unwrap().remove(&old_ep);
+            }
+            self.id_to_ip.write().unwrap().remove(&old_peer.peer_id);
+        }
         let mut peer = Peer::new(*public_key, wolfnet_ip);
         peer.endpoint = Some(endpoint);
         peer.hostname = hostname.to_string();
