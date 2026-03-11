@@ -601,6 +601,13 @@ fn run_daemon(config_path: &PathBuf) {
         let poll_ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 50) };
 
         if poll_ret > 0 {
+        // If poll returned ready but neither fd has POLLIN, a persistent error
+        // condition (POLLERR/POLLHUP) would cause poll to return immediately
+        // every time — sleep to prevent busy-spinning
+        if pfds[0].revents & libc::POLLIN == 0 && pfds[1].revents & libc::POLLIN == 0 {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
         // ── 1. Outbound: TUN → encrypt → UDP ──────────────────────────────
         if pfds[0].revents & libc::POLLIN != 0 {
             loop {
