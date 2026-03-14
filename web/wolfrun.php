@@ -347,65 +347,6 @@ to restore full HA coverage.</code></pre>
             </div>
 
             <div class="content-section">
-                <h2>REST API</h2>
-                <p>WolfRun is fully controllable via the REST API. All endpoints require authentication via the <code>wolfstack_session</code> cookie (browser) or <code>X-WolfStack-Secret</code> header (inter-node).</p>
-                <div class="table-wrapper">
-                    <table class="data-table" style="min-width:650px;">
-                        <thead>
-                            <tr>
-                                <th>Method</th>
-                                <th>Endpoint</th>
-                                <th>Description</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr><td><code>GET</code></td><td><code>/api/wolfrun/services</code></td><td>List all services (filter by <code>?cluster=name</code>)</td></tr>
-                            <tr><td><code>POST</code></td><td><code>/api/wolfrun/services</code></td><td>Create a new service</td></tr>
-                            <tr><td><code>GET</code></td><td><code>/api/wolfrun/services/{id}</code></td><td>Get a single service with all instances</td></tr>
-                            <tr><td><code>DELETE</code></td><td><code>/api/wolfrun/services/{id}</code></td><td>Delete a service and destroy cloned containers</td></tr>
-                            <tr><td><code>POST</code></td><td><code>/api/wolfrun/services/{id}/scale</code></td><td>Scale a service (<code>{"replicas": 5}</code>)</td></tr>
-                            <tr><td><code>POST</code></td><td><code>/api/wolfrun/services/{id}/settings</code></td><td>Update settings (min/max replicas, LB policy, failover, allowed nodes)</td></tr>
-                            <tr><td><code>POST</code></td><td><code>/api/wolfrun/services/{id}/action</code></td><td>Start, stop, or restart all active instances</td></tr>
-                            <tr><td><code>POST</code></td><td><code>/api/wolfrun/services/{id}/update</code></td><td>Rolling update &mdash; change the Docker image</td></tr>
-                            <tr><td><code>POST</code></td><td><code>/api/wolfrun/services/adopt</code></td><td>Adopt an existing container into WolfRun</td></tr>
-                            <tr><td><code>GET</code></td><td><code>/api/wolfrun/failover-events</code></td><td>List failover events (filter by <code>?service_id=id</code>)</td></tr>
-                            <tr><td><code>GET</code></td><td><code>/api/wolfrun/services/{id}/portforward</code></td><td>List port forwarding rules for a service</td></tr>
-                            <tr><td><code>POST</code></td><td><code>/api/wolfrun/services/{id}/portforward</code></td><td>Add a port forwarding rule</td></tr>
-                            <tr><td><code>DELETE</code></td><td><code>/api/wolfrun/services/{id}/portforward/{rule}</code></td><td>Remove a port forwarding rule</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-
-                <h3>Example: Create a Service</h3>
-                <div class="code-block" style="margin:0.5rem 0 1rem 0;">
-                    <div class="code-header"><span class="code-lang">bash</span></div>
-                    <pre><code>curl -k -b "wolfstack_session=YOUR_SESSION" \
-  -X POST https://your-server:8553/api/wolfrun/services \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Web App",
-    "image": "nginx:latest",
-    "runtime": "docker",
-    "replicas": 3,
-    "cluster_name": "MyCluster",
-    "ports": ["80:80"],
-    "env": ["NGINX_HOST=example.com"],
-    "restart_policy": "always",
-    "failover": true
-  }'</code></pre>
-                </div>
-
-                <h3>Example: Scale a Service</h3>
-                <div class="code-block" style="margin:0.5rem 0 1rem 0;">
-                    <div class="code-header"><span class="code-lang">bash</span></div>
-                    <pre><code>curl -k -b "wolfstack_session=YOUR_SESSION" \
-  -X POST https://your-server:8553/api/wolfrun/services/svc-a1b2c3d4/scale \
-  -H "Content-Type: application/json" \
-  -d '{"replicas": 5}'</code></pre>
-                </div>
-            </div>
-
-            <div class="content-section">
                 <h2>Configuration &amp; Persistence</h2>
                 <p>WolfRun stores all state as JSON files in <code>/etc/wolfstack/wolfrun/</code>:</p>
                 <ul>
