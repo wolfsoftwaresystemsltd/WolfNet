@@ -255,6 +255,10 @@ include 'includes/head.php';
                         <h3>WolfProxy</h3>
                         <p>NGINX-compatible reverse proxy with a built-in firewall. Drop-in replacement &mdash; reads your existing config.</p>
                     </a>
+                    <a href="wolfrun.php" class="hp-product">
+                        <h3>WolfRun <span class="hp-product-tag hp-tag-builtin">Built In</span></h3>
+                        <p>Native container orchestration. Schedule, scale, load-balance, and failover Docker &amp; LXC services across your cluster with zero external dependencies.</p>
+                    </a>
                     <a href="wolfkube.php" class="hp-product">
                         <h3>WolfKube <span class="hp-product-tag hp-tag-builtin">Built In</span></h3>
                         <p>Kubernetes cluster management. Provision k3s, MicroK8s, kubeadm, and more. Full pod management with terminal, logs, processes, disk, and resource metrics. Persistent storage, deployment management, and private WolfNet load balancer.</p>
@@ -296,6 +300,7 @@ include 'includes/head.php';
                     <a href="wolfstack.php" class="doc-card"><h3>WolfStack</h3><p>Overview</p></a>
                     <a href="quickstart.php" class="doc-card"><h3>Quick Start</h3><p>Install &amp; setup</p></a>
                     <a href="wolfstack-containers.php" class="doc-card"><h3>Containers</h3><p>Docker &amp; LXC</p></a>
+                    <a href="wolfrun.php" class="doc-card"><h3>WolfRun</h3><p>Orchestration</p></a>
                     <a href="wolfnet.php" class="doc-card"><h3>WolfNet</h3><p>Private network</p></a>
                     <a href="features.php" class="doc-card"><h3>Features</h3><p>Full list</p></a>
                 </div>
