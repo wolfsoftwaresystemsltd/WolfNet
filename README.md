@@ -6,7 +6,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-FSL--1.1-blue.svg)](LICENSE)
-[![Patreon](https://img.shields.io/badge/Patreon-Support%20Us-orange.svg)](https://www.patreon.com/15362110/join)
+[![Sponsor](https://img.shields.io/badge/Sponsor-❤-ea4aaa.svg)](https://github.com/sponsors/wolfsoftwaresystemsltd)
 
 **[wolfscale.org](https://wolfscale.org)** • **[wolf.uk.com](https://wolf.uk.com)** • **[Discord](https://discord.gg/q9qMjHjUQY)** • **[Reddit](https://www.reddit.com/r/WolfStack/)**
 
@@ -360,7 +360,7 @@ name = "home-server"
 
 ## Support
 
-- ❤️ **Patreon:** [Support development](https://www.patreon.com/15362110/join)
+- ❤️ **Sponsor:** [Support development](https://github.com/sponsors/wolfsoftwaresystemsltd)
 - 💬 **Discord:** [Join our community](https://discord.gg/q9qMjHjUQY)
 - 🔥 **Reddit:** [r/WolfStack](https://www.reddit.com/r/WolfStack/)
 - 🌐 **Website:** [wolf.uk.com](https://wolf.uk.com)
