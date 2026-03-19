@@ -597,15 +597,16 @@ fn run_daemon(config_path: &PathBuf) {
     let mut last_route_reload = Instant::now();
 
     while running.load(Ordering::Relaxed) {
-        // Block until TUN or UDP has data (50ms timeout for periodic tasks)
-        let poll_ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 50) };
+        // Block until TUN or UDP has data (500ms timeout for periodic tasks)
+        // Periodic tasks run at 10-60s intervals so 500ms is plenty responsive
+        let poll_ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 500) };
 
         if poll_ret > 0 {
         // If poll returned ready but neither fd has POLLIN, a persistent error
         // condition (POLLERR/POLLHUP) would cause poll to return immediately
         // every time — sleep to prevent busy-spinning
         if pfds[0].revents & libc::POLLIN == 0 && pfds[1].revents & libc::POLLIN == 0 {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(100));
             continue;
         }
         // ── 1. Outbound: TUN → encrypt → UDP ──────────────────────────────
