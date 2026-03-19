@@ -37,6 +37,11 @@ pub struct NetworkConfig {
     #[serde(default = "default_port")]
     pub listen_port: u16,
 
+    /// Bind address for the UDP socket (default: 0.0.0.0 = all interfaces)
+    /// Set to a specific IP to restrict which interface WolfNet listens on
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
+
     /// Act as a gateway (NAT internet traffic for other nodes)
     #[serde(default)]
     pub gateway: bool,
@@ -87,6 +92,7 @@ fn default_subnet() -> u8 { 24 }
 fn default_port() -> u16 { 9600 }
 fn default_true() -> bool { true }
 fn default_mtu() -> u16 { 1400 }
+fn default_bind_address() -> String { "0.0.0.0".into() }
 fn default_key_path() -> PathBuf { PathBuf::from("/etc/wolfnet/private.key") }
 
 /// Status information written by daemon, read by wolfnetctl
@@ -196,6 +202,7 @@ impl Default for Config {
                 address: "10.0.10.1".into(),
                 subnet: default_subnet(),
                 listen_port: default_port(),
+                bind_address: default_bind_address(),
                 gateway: false,
                 discovery: true,
                 mtu: default_mtu(),

@@ -473,7 +473,7 @@ fn run_daemon(config_path: &PathBuf) {
     });
 
     // Create UDP socket
-    let bind_addr = format!("0.0.0.0:{}", config.network.listen_port);
+    let bind_addr = format!("{}:{}", config.network.bind_address, config.network.listen_port);
     let socket = Arc::new(UdpSocket::bind(&bind_addr).unwrap_or_else(|e| {
         error!("Failed to bind UDP {}: {}", bind_addr, e);
         std::process::exit(1);
