@@ -801,14 +801,14 @@ fn run_daemon(config_path: &PathBuf) {
                                                             encrypt_and_send(&mut send_buf, plaintext, host_peer, &my_peer_id, &socket);
                                                         });
                                                     }
-                                                } else {
-                                                    unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
                                                 }
+                                                // else: drop — writing an unroutable packet back to TUN
+                                                // creates an infinite routing loop (kernel routes it
+                                                // back to wolfnet0 since dest is in our subnet)
                                             }
                                         }
-                                    } else {
-                                        unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
                                     }
+                                    // else: non-IPv4 packet with no dest IP — drop silently
                                 }
                                 Err(e) => {
                                     debug!("Decrypt failed from {} (counter={}): {}", peer_ip, counter, e);
