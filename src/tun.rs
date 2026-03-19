@@ -126,6 +126,26 @@ impl TunDevice {
             .args(["device", "set", &self.name, "managed", "no"])
             .output();
 
+        // Prevent Tailscale routing loop — if Tailscale is running, its WireGuard
+        // traffic (port 41641) can get routed into wolfnet0 via the subnet route,
+        // creating a feedback loop where Tailscale traffic goes through WolfNet
+        // and back through Tailscale. Block it with an iptables OUTPUT rule.
+        if std::process::Command::new("pidof").arg("tailscaled").output()
+            .map(|o| o.status.success()).unwrap_or(false)
+        {
+            let subnet = format!("{}/{}", address, subnet);
+            // Check if the rule already exists before adding
+            let exists = std::process::Command::new("iptables")
+                .args(["-C", "OUTPUT", "-p", "udp", "--dport", "41641", "-d", &subnet, "-j", "DROP"])
+                .output()
+                .map(|o| o.status.success()).unwrap_or(false);
+            if !exists {
+                let _ = std::process::Command::new("iptables")
+                    .args(["-I", "OUTPUT", "-p", "udp", "--dport", "41641", "-d", &subnet, "-j", "DROP"])
+                    .status();
+            }
+        }
+
         Ok(())
     }
 
