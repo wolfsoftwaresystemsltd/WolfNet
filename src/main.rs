@@ -718,12 +718,21 @@ fn run_daemon(config_path: &PathBuf) {
                         if let Some((pub_key, peer_ip, _peer_port, is_gw, peer_hostname)) = transport::parse_handshake(data) {
                             let endpoint = src;
                             peer_manager.update_from_discovery(&pub_key, endpoint, peer_ip, &peer_hostname, is_gw);
+                            // Check if peer was already connected BEFORE re-establishing session
+                            let was_connected = peer_manager.with_peer_by_ip(&peer_ip, |peer| {
+                                peer.is_connected()
+                            }).unwrap_or(false);
                             peer_manager.with_peer_by_ip(&peer_ip, |peer| {
                                 peer.establish_session(&keypair.secret, &keypair.public);
                                 peer.last_seen = Some(Instant::now());
                             });
-                            let reply = transport::build_handshake(&keypair, wolfnet_ip, config.network.listen_port, &hostname, is_gateway);
-                            let _ = socket.send_to(&reply, src);
+                            // Only reply if peer was NOT already connected — prevents
+                            // handshake ping-pong where two nodes bounce handshakes
+                            // back and forth at wire speed, burning CPU
+                            if !was_connected {
+                                let reply = transport::build_handshake(&keypair, wolfnet_ip, config.network.listen_port, &hostname, is_gateway);
+                                let _ = socket.send_to(&reply, src);
+                            }
                         }
                     }
                     transport::PKT_DATA if n > 13 => {
