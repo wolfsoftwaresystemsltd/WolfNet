@@ -183,17 +183,25 @@ fn cmd_init(config_path: &PathBuf, address: &str) {
 
 /// Resolve an endpoint string to a SocketAddr.
 /// Supports both IP:port (e.g. "203.0.113.5:9600") and hostname:port (e.g. "myhome.dyndns.org:9600").
+/// Rejects unroutable addresses (0.0.0.0, 127.x.x.x) that would loop back to self.
 fn resolve_endpoint(ep: &str) -> Option<SocketAddr> {
     // Try direct parse first (fastest path for IP:port)
     if let Ok(addr) = ep.parse::<SocketAddr>() {
+        if is_unusable_endpoint(&addr) {
+            warn!("Skipping unusable endpoint '{}' (loopback/unspecified)", ep);
+            return None;
+        }
         return Some(addr);
     }
     // Fall back to DNS resolution (supports hostnames like myhome.dyndns.org:9600)
     match ep.to_socket_addrs() {
         Ok(mut addrs) => {
             let result = addrs.next();
-            if let Some(_addr) = result {
-
+            if let Some(ref addr) = result {
+                if is_unusable_endpoint(addr) {
+                    warn!("Skipping unusable endpoint '{}' (resolved to loopback/unspecified)", ep);
+                    return None;
+                }
             } else {
                 warn!("DNS resolution for '{}' returned no addresses", ep);
             }
@@ -202,6 +210,20 @@ fn resolve_endpoint(ep: &str) -> Option<SocketAddr> {
         Err(e) => {
             warn!("Failed to resolve endpoint '{}': {}", ep, e);
             None
+        }
+    }
+}
+
+/// Check if an endpoint is unusable (would send to self or nowhere)
+fn is_unusable_endpoint(addr: &SocketAddr) -> bool {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let ip = v4.ip();
+            ip.is_unspecified() || ip.is_loopback()
+        }
+        SocketAddr::V6(v6) => {
+            let ip = v6.ip();
+            ip.is_unspecified() || ip.is_loopback()
         }
     }
 }
@@ -927,7 +949,7 @@ fn run_daemon(config_path: &PathBuf) {
                                 p.relay_via.is_none() && p.is_connected()
                             }).unwrap_or(false);
                             if !is_direct {
-                                peer_manager.remove_peer(ip);
+                                peer_manager.purge_peer(ip);
                                 removed += 1;
                             }
                         }

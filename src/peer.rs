@@ -125,6 +125,8 @@ pub struct PeerManager {
     endpoint_to_ip: Arc<RwLock<HashMap<SocketAddr, Ipv4Addr>>>,
     /// Subnet routes: container/VM IP → host peer IP (for routing to containers on remote nodes)
     subnet_routes: Arc<RwLock<HashMap<Ipv4Addr, Ipv4Addr>>>,
+    /// IPs purged via SIGHUP — blocked from PEX re-addition until daemon restart
+    purged_ips: Arc<RwLock<std::collections::HashSet<Ipv4Addr>>>,
 }
 
 impl PeerManager {
@@ -134,6 +136,7 @@ impl PeerManager {
             id_to_ip: Arc::new(RwLock::new(HashMap::new())),
             endpoint_to_ip: Arc::new(RwLock::new(HashMap::new())),
             subnet_routes: Arc::new(RwLock::new(HashMap::new())),
+            purged_ips: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -159,6 +162,12 @@ impl PeerManager {
                 self.endpoint_to_ip.write().unwrap().remove(&ep);
             }
         }
+    }
+
+    /// Purge a peer and block it from being re-added by PEX
+    pub fn purge_peer(&self, ip: &Ipv4Addr) {
+        self.remove_peer(ip);
+        self.purged_ips.write().unwrap().insert(*ip);
     }
 
     /// Get a mutable reference to a peer by WolfNet IP (via callback to avoid lock issues)
@@ -388,6 +397,8 @@ impl PeerManager {
         let my_octets = my_ip.octets();
         let my_prefix = [my_octets[0], my_octets[1], my_octets[2]];
 
+        let purged = self.purged_ips.read().unwrap();
+
         for entry in entries {
             // Skip ourselves
             let entry_ip: Ipv4Addr = match entry.wolfnet_ip.parse() {
@@ -395,6 +406,9 @@ impl PeerManager {
                 Err(_) => continue,
             };
             if entry_ip == my_ip { continue; }
+
+            // Skip peers that were purged via SIGHUP — prevents PEX re-adding ghost peers
+            if purged.contains(&entry_ip) { continue; }
 
             // Reject peers on a different /24 subnet — prevents cross-subnet ghost peers
             let entry_octets = entry_ip.octets();
