@@ -32,6 +32,8 @@ enum Commands {
     Peers,
     /// Show network summary
     Info,
+    /// Purge stale/ghost peers — reloads config and removes any peers not in config.toml
+    Purge,
 }
 
 #[derive(Subcommand)]
@@ -80,6 +82,7 @@ fn main() {
         },
         Commands::Peers => cmd_peers(&status),
         Commands::Info => cmd_info(&status),
+        Commands::Purge => cmd_purge(),
     }
 }
 
@@ -200,6 +203,51 @@ fn cmd_info(status: &NodeStatus) {
     if !status.peers.is_empty() {
         cmd_peers(status);
     }
+}
+
+fn cmd_purge() {
+    println!();
+    println!("  🧹 Purging stale peers...");
+    println!();
+
+    // Delete routes.json to clear stale route entries
+    let routes_path = "/var/run/wolfnet/routes.json";
+    if std::path::Path::new(routes_path).exists() {
+        match std::fs::remove_file(routes_path) {
+            Ok(_) => println!("  ✓ Deleted {}", routes_path),
+            Err(e) => println!("  ✗ Could not delete {}: {}", routes_path, e),
+        }
+    }
+
+    // Send SIGHUP to wolfnet daemon to reload config and purge non-configured peers
+    let pid_output = std::process::Command::new("pidof")
+        .arg("wolfnet")
+        .output();
+    match pid_output {
+        Ok(output) if output.status.success() => {
+            let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // pidof may return multiple PIDs — take the first
+            if let Some(pid) = pid_str.split_whitespace().next() {
+                match std::process::Command::new("kill")
+                    .args(["-HUP", pid])
+                    .status()
+                {
+                    Ok(s) if s.success() => {
+                        println!("  ✓ Sent SIGHUP to wolfnet (PID {})", pid);
+                        println!("    Daemon will reload config and remove peers not in config.toml");
+                    }
+                    _ => println!("  ✗ Failed to send SIGHUP to PID {}", pid),
+                }
+            } else {
+                println!("  ✗ WolfNet daemon not found — is it running?");
+            }
+        }
+        _ => println!("  ✗ WolfNet daemon not found — is it running?"),
+    }
+
+    println!();
+    println!("  Run 'wolfnetctl peers' to verify the ghost peers are gone.");
+    println!();
 }
 
 fn format_duration(secs: u64) -> String {

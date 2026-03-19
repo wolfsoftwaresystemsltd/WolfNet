@@ -150,6 +150,17 @@ impl PeerManager {
         self.peers_by_ip.write().unwrap().insert(ip, peer);
     }
 
+    /// Remove a peer by WolfNet IP (used for purging stale PEX entries)
+    pub fn remove_peer(&self, ip: &Ipv4Addr) {
+        let mut peers = self.peers_by_ip.write().unwrap();
+        if let Some(peer) = peers.remove(ip) {
+            self.id_to_ip.write().unwrap().remove(&peer.peer_id);
+            if let Some(ep) = peer.endpoint {
+                self.endpoint_to_ip.write().unwrap().remove(&ep);
+            }
+        }
+    }
+
     /// Get a mutable reference to a peer by WolfNet IP (via callback to avoid lock issues)
     pub fn with_peer_by_ip<F, R>(&self, ip: &Ipv4Addr, f: F) -> Option<R>
     where F: FnOnce(&mut Peer) -> R {
@@ -373,6 +384,10 @@ impl PeerManager {
     ) {
         let mut peers = self.peers_by_ip.write().unwrap();
 
+        // Derive our subnet (first 3 octets) for filtering
+        let my_octets = my_ip.octets();
+        let my_prefix = [my_octets[0], my_octets[1], my_octets[2]];
+
         for entry in entries {
             // Skip ourselves
             let entry_ip: Ipv4Addr = match entry.wolfnet_ip.parse() {
@@ -380,6 +395,12 @@ impl PeerManager {
                 Err(_) => continue,
             };
             if entry_ip == my_ip { continue; }
+
+            // Reject peers on a different /24 subnet — prevents cross-subnet ghost peers
+            let entry_octets = entry_ip.octets();
+            if entry_octets[0] != my_prefix[0] || entry_octets[1] != my_prefix[1] || entry_octets[2] != my_prefix[2] {
+                continue;
+            }
 
             // Skip if we already know this peer directly (LAN discovery or configured)
             if let Some(existing) = peers.get(&entry_ip) {

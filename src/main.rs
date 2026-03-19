@@ -913,7 +913,25 @@ fn run_daemon(config_path: &PathBuf) {
                             Err(e) => warn!("Reload: invalid peer public key: {}", e),
                         }
                     }
-                    info!("Config reload complete: {} new peer(s), {} updated", added, updated);
+                    // Purge peers NOT in the config (removes PEX ghosts)
+                    let configured_ips: std::collections::HashSet<Ipv4Addr> = new_config.peers.iter()
+                        .filter_map(|pc| pc.allowed_ip.parse().ok())
+                        .collect();
+                    let all_runtime_ips = peer_manager.all_ips();
+                    let mut removed = 0;
+                    for ip in &all_runtime_ips {
+                        if !configured_ips.contains(ip) {
+                            // Check if this peer is directly connected (LAN discovery)
+                            let is_direct = peer_manager.with_peer_by_ip(ip, |p| {
+                                p.relay_via.is_none() && p.is_connected()
+                            }).unwrap_or(false);
+                            if !is_direct {
+                                peer_manager.remove_peer(ip);
+                                removed += 1;
+                            }
+                        }
+                    }
+                    info!("Config reload complete: {} added, {} updated, {} purged", added, updated, removed);
 
                     // Also reload subnet routes
                     peer_manager.load_routes(&routes_path);
