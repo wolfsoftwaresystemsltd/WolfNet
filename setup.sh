@@ -63,6 +63,31 @@ else
     echo "✓ /dev/net/tun available"
 fi
 
+# ─── Architecture detection for prebuilt binaries ──────────────────────────
+HOST_ARCH=$(uname -m)
+case "$HOST_ARCH" in
+    x86_64)  BINARY_ARCH="x86_64" ;;
+    aarch64) BINARY_ARCH="aarch64" ;;
+    *)       BINARY_ARCH="" ;;
+esac
+
+# Try prebuilt binaries first — skips Rust install, clone, and build entirely
+PREBUILT_OK=false
+if [ -n "$BINARY_ARCH" ]; then
+    echo ""
+    echo "Downloading prebuilt binaries for ${BINARY_ARCH}..."
+    PREBUILT_URL="https://github.com/wolfsoftwaresystemsltd/WolfNet/releases/latest/download"
+    if curl -fSL --connect-timeout 10 --max-time 120 -o /tmp/wolfnet "$PREBUILT_URL/wolfnet-${BINARY_ARCH}" 2>/dev/null; then
+        chmod +x /tmp/wolfnet
+        curl -fSL --connect-timeout 10 --max-time 60 -o /tmp/wolfnetctl "$PREBUILT_URL/wolfnetctl-${BINARY_ARCH}" 2>/dev/null && chmod +x /tmp/wolfnetctl || true
+        PREBUILT_OK=true
+        echo "✓ Prebuilt binaries downloaded"
+    else
+        echo "⚠ Prebuilt binaries not available — will build from source"
+        rm -f /tmp/wolfnet /tmp/wolfnetctl
+    fi
+fi
+
 # Detect package manager
 if command -v apt &> /dev/null; then
     PKG_MANAGER="apt"
@@ -79,81 +104,85 @@ else
     exit 1
 fi
 
-# Install dependencies
-echo ""
-echo "Installing system dependencies..."
+if [ "$PREBUILT_OK" = "false" ]; then
+    # Need to build from source — install dependencies, Rust, and clone repo
 
-if [ "$PKG_MANAGER" = "apt" ]; then
-    apt update
-    apt install -y git curl build-essential pkg-config libssl-dev
-elif [ "$PKG_MANAGER" = "dnf" ]; then
-    dnf install -y git curl gcc gcc-c++ make openssl-devel pkg-config
-elif [ "$PKG_MANAGER" = "yum" ]; then
-    yum install -y git curl gcc gcc-c++ make openssl-devel pkgconfig
-fi
-
-echo "✓ System dependencies installed"
-
-# Install Rust if not present (install as the real user, not root)
-CARGO_BIN="$REAL_HOME/.cargo/bin/cargo"
-
-if [ -f "$CARGO_BIN" ]; then
-    echo "✓ Rust already installed"
-elif command -v cargo &> /dev/null; then
-    CARGO_BIN="$(command -v cargo)"
-    echo "✓ Rust already installed (system-wide)"
-else
+    # Install dependencies
     echo ""
-    echo "Installing Rust for user '$REAL_USER'..."
-    if [ "$REAL_USER" = "root" ]; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    else
-        su - "$REAL_USER" -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+    echo "Installing system dependencies..."
+
+    if [ "$PKG_MANAGER" = "apt" ]; then
+        apt update
+        apt install -y git curl build-essential pkg-config libssl-dev
+    elif [ "$PKG_MANAGER" = "dnf" ]; then
+        dnf install -y git curl gcc gcc-c++ make openssl-devel pkg-config
+    elif [ "$PKG_MANAGER" = "yum" ]; then
+        yum install -y git curl gcc gcc-c++ make openssl-devel pkgconfig
     fi
-    echo "✓ Rust installed"
+
+    echo "✓ System dependencies installed"
+
+    # Install Rust if not present (install as the real user, not root)
+    CARGO_BIN="$REAL_HOME/.cargo/bin/cargo"
+
+    if [ -f "$CARGO_BIN" ]; then
+        echo "✓ Rust already installed"
+    elif command -v cargo &> /dev/null; then
+        CARGO_BIN="$(command -v cargo)"
+        echo "✓ Rust already installed (system-wide)"
+    else
+        echo ""
+        echo "Installing Rust for user '$REAL_USER'..."
+        if [ "$REAL_USER" = "root" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        else
+            su - "$REAL_USER" -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+        fi
+        echo "✓ Rust installed"
+    fi
+
+    # Ensure cargo is found
+    export PATH="$REAL_HOME/.cargo/bin:/usr/local/bin:/usr/bin:$PATH"
+
+    if ! command -v cargo &> /dev/null; then
+        echo "✗ cargo not found after installation. Check Rust install."
+        exit 1
+    fi
+
+    echo "✓ Using cargo: $(command -v cargo)"
+
+    # Clone or update repository
+    INSTALL_DIR="/opt/wolfscale-src"
+    echo ""
+    echo "Cloning WolfScale repository..."
+
+    if [ -d "$INSTALL_DIR" ]; then
+        echo "  Updating existing installation..."
+        cd "$INSTALL_DIR"
+        git fetch origin
+        git reset --hard origin/main
+    else
+        git clone https://github.com/wolfsoftwaresystemsltd/WolfScale.git "$INSTALL_DIR"
+        cd "$INSTALL_DIR"
+    fi
+
+    echo "✓ Repository cloned to $INSTALL_DIR"
+
+    # Build WolfNet (as the real user if possible, to use their cargo)
+    echo ""
+    echo "Building WolfNet (this may take a few minutes)..."
+    cd "$INSTALL_DIR/wolfnet"
+
+    if [ "$REAL_USER" != "root" ] && [ -f "$REAL_HOME/.cargo/bin/cargo" ]; then
+        # Build as the real user so cargo uses their toolchain
+        chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
+        su - "$REAL_USER" -c "cd $INSTALL_DIR/wolfnet && $REAL_HOME/.cargo/bin/cargo build --release"
+    else
+        cargo build --release
+    fi
+
+    echo "✓ Build complete"
 fi
-
-# Ensure cargo is found
-export PATH="$REAL_HOME/.cargo/bin:/usr/local/bin:/usr/bin:$PATH"
-
-if ! command -v cargo &> /dev/null; then
-    echo "✗ cargo not found after installation. Check Rust install."
-    exit 1
-fi
-
-echo "✓ Using cargo: $(command -v cargo)"
-
-# Clone or update repository
-INSTALL_DIR="/opt/wolfscale-src"
-echo ""
-echo "Cloning WolfScale repository..."
-
-if [ -d "$INSTALL_DIR" ]; then
-    echo "  Updating existing installation..."
-    cd "$INSTALL_DIR"
-    git fetch origin
-    git reset --hard origin/main
-else
-    git clone https://github.com/wolfsoftwaresystemsltd/WolfScale.git "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
-fi
-
-echo "✓ Repository cloned to $INSTALL_DIR"
-
-# Build WolfNet (as the real user if possible, to use their cargo)
-echo ""
-echo "Building WolfNet (this may take a few minutes)..."
-cd "$INSTALL_DIR/wolfnet"
-
-if [ "$REAL_USER" != "root" ] && [ -f "$REAL_HOME/.cargo/bin/cargo" ]; then
-    # Build as the real user so cargo uses their toolchain
-    chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
-    su - "$REAL_USER" -c "cd $INSTALL_DIR/wolfnet && $REAL_HOME/.cargo/bin/cargo build --release"
-else
-    cargo build --release
-fi
-
-echo "✓ Build complete"
 
 # Stop service if running (for upgrades)
 if systemctl is-active --quiet wolfnet 2>/dev/null; then
@@ -175,16 +204,23 @@ if [ -f "/usr/local/bin/wolfnet" ]; then
 else
     echo "Installing WolfNet..."
 fi
-cp "$INSTALL_DIR/wolfnet/target/release/wolfnet" /usr/local/bin/wolfnet
-chmod +x /usr/local/bin/wolfnet
-echo "✓ wolfnet installed to /usr/local/bin/wolfnet"
 
-# Install wolfnetctl if it exists
-if [ -f "$INSTALL_DIR/wolfnet/target/release/wolfnetctl" ]; then
-    cp "$INSTALL_DIR/wolfnet/target/release/wolfnetctl" /usr/local/bin/wolfnetctl
-    chmod +x /usr/local/bin/wolfnetctl
-    echo "✓ wolfnetctl installed to /usr/local/bin/wolfnetctl"
+if [ "$PREBUILT_OK" = "true" ]; then
+    mv /tmp/wolfnet /usr/local/bin/wolfnet
+    if [ -f /tmp/wolfnetctl ]; then
+        mv /tmp/wolfnetctl /usr/local/bin/wolfnetctl
+        echo "✓ wolfnetctl installed to /usr/local/bin/wolfnetctl"
+    fi
+else
+    cp "$INSTALL_DIR/wolfnet/target/release/wolfnet" /usr/local/bin/wolfnet
+    chmod +x /usr/local/bin/wolfnet
+    if [ -f "$INSTALL_DIR/wolfnet/target/release/wolfnetctl" ]; then
+        cp "$INSTALL_DIR/wolfnet/target/release/wolfnetctl" /usr/local/bin/wolfnetctl
+        chmod +x /usr/local/bin/wolfnetctl
+        echo "✓ wolfnetctl installed to /usr/local/bin/wolfnetctl"
+    fi
 fi
+echo "✓ wolfnet installed to /usr/local/bin/wolfnet"
 
 # Create directories
 echo ""
