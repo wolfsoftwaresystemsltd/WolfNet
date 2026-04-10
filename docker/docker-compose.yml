@@ -1,0 +1,30 @@
+# WolfNet Docker Compose — join an existing WolfNet mesh
+#
+# Usage:
+#   WOLFNET_JOIN_TOKEN=<token> docker compose up -d
+#
+# Get the join token by running `wolfnet invite` on an existing WolfNet node.
+
+services:
+  wolfnet:
+    image: ghcr.io/wolfsoftwaresystemsltd/wolfnet:latest
+    container_name: wolfnet
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - wolfnet-config:/etc/wolfnet
+      - /run/wolfnet:/var/run/wolfnet
+    environment:
+      - WOLFNET_JOIN_TOKEN=${WOLFNET_JOIN_TOKEN:-}
+      # Optional overrides:
+      # - WOLFNET_ADDRESS=10.0.10.5
+      # - WOLFNET_PORT=9600
+      # - WOLFNET_GATEWAY=false
+      # - WOLFNET_DISCOVERY=true
+
+volumes:
+  wolfnet-config:
