@@ -1,5 +1,8 @@
-# WolfNet Docker Container
-# Secure mesh VPN — runs in --network host mode with /dev/net/tun
+# WolfNet Docker Container — secure mesh VPN
+#
+# Runs in --network host mode with /dev/net/tun. Pre-built static musl
+# binaries are placed under dist/<arch>/ by the publish workflow; this
+# Dockerfile copies the right one based on TARGETARCH.
 #
 # Usage:
 #   docker run -d --name wolfnet --network host \
@@ -10,6 +13,8 @@
 
 FROM debian:bookworm-slim
 
+ARG TARGETARCH
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     iptables \
@@ -19,9 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN mkdir -p /etc/wolfnet /var/run/wolfnet
 
-COPY wolfnet /usr/local/bin/wolfnet
-COPY wolfnetctl /usr/local/bin/wolfnetctl
-COPY entrypoint.sh /entrypoint.sh
+COPY dist/${TARGETARCH}/wolfnet /usr/local/bin/wolfnet
+COPY dist/${TARGETARCH}/wolfnetctl /usr/local/bin/wolfnetctl
+COPY docker/entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /usr/local/bin/wolfnet /usr/local/bin/wolfnetctl /entrypoint.sh
 
