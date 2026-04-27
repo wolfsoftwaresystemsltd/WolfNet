@@ -66,14 +66,36 @@ pub fn enable_gateway(wolfnet_interface: &str, subnet: &str) -> Result<(), Box<d
         warn!("iptables FORWARD rule (in) may have failed");
     }
 
-    // Block all other inbound traffic to wolfnet (truly private)
-    let status = std::process::Command::new("iptables")
-        .args(["-A", "INPUT", "-i", &ext_iface, "-d", subnet, "-j", "DROP"])
-        .status()?;
-    if !status.success() {
-        warn!("iptables INPUT DROP rule may have failed");
+    // Removed in 0.5.18: an `-A INPUT -i <ext> -d <subnet> -j DROP` rule
+    // used to live here under the banner "Block all other inbound traffic
+    // to wolfnet (truly private)". klasSponsor (2026-04-27) confirmed it
+    // was breaking WolfRouter subnet routing on multiple nodes — peers'
+    // packets and replies that legitimately transited via the WolfNet
+    // CGNAT range were getting dropped depending on the path.
+    //
+    // The rule also wasn't actually defending anything: a packet on the
+    // WAN destined for an RFC1918/CGNAT IP can only reach INPUT if that
+    // IP is local to this host (i.e. its wolfnet0 address) — and packets
+    // from the public internet to a host's wolfnet0 IP can't actually
+    // arrive without spoofing or a misrouted upstream, neither of which
+    // the rule meaningfully mitigates. WolfNet privacy comes from the
+    // encrypted overlay itself, not from filtering at the gateway's
+    // INPUT chain.
+    //
+    // Belt-and-braces: proactively delete any copy of the old rule that's
+    // still installed on existing nodes from previous releases, so an
+    // upgrade-and-restart of WolfNet quietly cleans them up. Repeated
+    // -D runs handle the case where multiple copies got appended on
+    // earlier daemon reloads.
+    for _ in 0..4 {
+        let status = std::process::Command::new("iptables")
+            .args(["-D", "INPUT", "-i", &ext_iface, "-d", subnet, "-j", "DROP"])
+            .status();
+        match status {
+            Ok(s) if s.success() => continue, // deleted one, try again
+            _ => break,                       // none left (or iptables missing)
+        }
     }
-
 
     Ok(())
 }
