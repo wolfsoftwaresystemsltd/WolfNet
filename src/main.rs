@@ -511,6 +511,14 @@ fn run_daemon(config_path: &PathBuf) {
     let routes_path = PathBuf::from("/var/run/wolfnet/routes.json");
     peer_manager.load_routes(&routes_path);
 
+    // Load CIDR-based subnet routes from WolfStack's WolfRouter config.
+    // Without this, packets the kernel routes via wolfnet0 toward a
+    // remote LAN (e.g. 10.10.0.0/16 advertised by peer 10.100.10.30)
+    // can't be encapsulated to the right peer — TUN devices have no
+    // link layer, so the kernel's "next-hop" hint is invisible to us.
+    let subnet_routes_path = PathBuf::from("/var/run/wolfnet/subnet-routes.json");
+    peer_manager.load_subnet_routes(&subnet_routes_path);
+
     // Gateway mode is only enabled explicitly in config — a gateway is a node
     // that bridges networks and relays traffic between peers that can't see each other
     let is_gateway = config.network.gateway;
@@ -688,6 +696,20 @@ fn run_daemon(config_path: &PathBuf) {
                         if routed { continue; }
                     }
 
+                    // CIDR subnet route — longest-prefix-match against the
+                    // CIDRs WolfStack advertised in subnet-routes.json. This
+                    // is what lets a kernel route like
+                    // `ip route add 10.10.0.0/16 via 10.100.10.30 dev wolfnet0`
+                    // actually do something: the kernel's next-hop hint is
+                    // invisible to a TUN, so we have to look the dest up
+                    // ourselves and encapsulate to the configured gateway.
+                    if let Some(gw_ip) = peer_manager.find_subnet_match(&dest_ip) {
+                        let routed = peer_manager.with_peer_by_ip(&gw_ip, |peer| {
+                            encrypt_and_send(&mut send_buf, pkt, peer, &my_peer_id, &socket)
+                        }).unwrap_or(false);
+                        if routed { continue; }
+                    }
+
                     if let Some(relay_ip) = peer_manager.find_relay_for(&dest_ip) {
                         peer_manager.with_peer_by_ip(&relay_ip, |peer| {
                             encrypt_and_send(&mut send_buf, pkt, peer, &my_peer_id, &socket);
@@ -793,6 +815,7 @@ fn run_daemon(config_path: &PathBuf) {
                                             }).unwrap_or(false);
 
                                             if !forwarded {
+                                                let mut handled = false;
                                                 if let Some(host_ip) = peer_manager.find_route(&dest_ip) {
                                                     if host_ip == wolfnet_ip {
                                                         unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
@@ -800,6 +823,24 @@ fn run_daemon(config_path: &PathBuf) {
                                                         peer_manager.with_peer_by_ip(&host_ip, |host_peer| {
                                                             encrypt_and_send(&mut send_buf, plaintext, host_peer, &my_peer_id, &socket);
                                                         });
+                                                    }
+                                                    handled = true;
+                                                }
+                                                if !handled {
+                                                    // CIDR subnet route. If we're the configured
+                                                    // gateway, write to TUN so the kernel +
+                                                    // WolfStack's iptables plumbing forward the
+                                                    // packet out the LAN-side iface. Otherwise
+                                                    // re-encapsulate to whichever peer IS the
+                                                    // gateway.
+                                                    if let Some(gw_ip) = peer_manager.find_subnet_match(&dest_ip) {
+                                                        if gw_ip == wolfnet_ip {
+                                                            unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
+                                                        } else {
+                                                            peer_manager.with_peer_by_ip(&gw_ip, |gw_peer| {
+                                                                encrypt_and_send(&mut send_buf, plaintext, gw_peer, &my_peer_id, &socket);
+                                                            });
+                                                        }
                                                     }
                                                 }
                                                 // else: drop — writing an unroutable packet back to TUN
@@ -883,6 +924,7 @@ fn run_daemon(config_path: &PathBuf) {
         //     from WolfStack without needing SIGHUP
         if last_route_reload.elapsed() > Duration::from_secs(15) {
             peer_manager.load_routes(&routes_path);
+            peer_manager.load_subnet_routes(&subnet_routes_path);
             last_route_reload = Instant::now();
         }
 
@@ -967,6 +1009,7 @@ fn run_daemon(config_path: &PathBuf) {
 
                     // Also reload subnet routes
                     peer_manager.load_routes(&routes_path);
+                    peer_manager.load_subnet_routes(&subnet_routes_path);
                 }
                 Err(e) => warn!("Config reload failed: {}", e),
             }

@@ -125,6 +125,18 @@ pub struct PeerManager {
     endpoint_to_ip: Arc<RwLock<HashMap<SocketAddr, Ipv4Addr>>>,
     /// Subnet routes: container/VM IP → host peer IP (for routing to containers on remote nodes)
     subnet_routes: Arc<RwLock<HashMap<Ipv4Addr, Ipv4Addr>>>,
+    /// CIDR subnet routes: (network, prefix, gateway WolfNet IP). Sorted
+    /// longest-prefix first so find_subnet_match can return on the
+    /// first hit. Populated from /var/run/wolfnet/subnet-routes.json,
+    /// which WolfStack writes when its WolfRouter SubnetRoute config
+    /// changes. Without this, packets read from the TUN whose dest IP
+    /// matches a kernel route via wolfnet0 (e.g. a remote LAN like
+    /// 10.10.0.0/16 reachable via peer 10.100.10.30) have no per-peer
+    /// destination — TUN devices have no link layer, so the kernel's
+    /// "next-hop" hint is meaningless to userspace — and the packet
+    /// would either get dropped (no peer match) or sent to the first
+    /// auto-gateway peer (often the wrong one).
+    subnet_routes_cidrs: Arc<RwLock<Vec<(Ipv4Addr, u8, Ipv4Addr)>>>,
     /// IPs purged via SIGHUP — blocked from PEX re-addition until daemon restart
     purged_ips: Arc<RwLock<std::collections::HashSet<Ipv4Addr>>>,
 }
@@ -136,6 +148,7 @@ impl PeerManager {
             id_to_ip: Arc::new(RwLock::new(HashMap::new())),
             endpoint_to_ip: Arc::new(RwLock::new(HashMap::new())),
             subnet_routes: Arc::new(RwLock::new(HashMap::new())),
+            subnet_routes_cidrs: Arc::new(RwLock::new(Vec::new())),
             purged_ips: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
@@ -359,6 +372,87 @@ impl PeerManager {
         }
     }
 
+    /// Load CIDR-based subnet routes from a JSON file (cidr → gateway WolfNet IP).
+    /// Called on startup and on SIGHUP. WolfStack writes this file from its
+    /// WolfRouter SubnetRoute config so userspace can do longest-prefix
+    /// matching for packets whose dest doesn't match any peer or any
+    /// container exact-IP route.
+    ///
+    /// Behaviour:
+    ///   • File missing → clear the table (nothing should be routed).
+    ///   • JSON parse fails → keep the previous table (don't blackhole
+    ///     traffic on a transient bad write). Matches load_routes.
+    ///   • Parse OK → replace the table with the parsed contents,
+    ///     sorted longest-prefix-first.
+    pub fn load_subnet_routes(&self, path: &std::path::Path) {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => {
+                // File missing — clear the table so deleted CIDRs go
+                // away. (load_routes returns without clearing here, but
+                // for subnet routes "no file" really does mean "no
+                // routes configured", and stale entries would cause
+                // wrong routing decisions.)
+                self.subnet_routes_cidrs.write().unwrap().clear();
+                return;
+            }
+        };
+        let map: HashMap<String, String> = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(_) => return, // keep existing table on parse failure
+        };
+
+        let mut parsed: Vec<(Ipv4Addr, u8, Ipv4Addr)> = Vec::new();
+        for (cidr, gw_str) in &map {
+            let (net_str, prefix_str) = match cidr.split_once('/') {
+                Some(p) => p,
+                None => continue,
+            };
+            let net: Ipv4Addr = match net_str.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let prefix: u8 = match prefix_str.parse() {
+                Ok(p) if p <= 32 => p,
+                _ => continue,
+            };
+            let gateway: Ipv4Addr = match gw_str.parse() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            parsed.push((net, prefix, gateway));
+        }
+        // Sort longest prefix first so find_subnet_match returns on the
+        // first hit (longest-prefix-match semantics, like the kernel).
+        parsed.sort_by(|a, b| b.1.cmp(&a.1));
+        *self.subnet_routes_cidrs.write().unwrap() = parsed;
+    }
+
+    /// Longest-prefix-match against the loaded CIDR subnet routes.
+    /// Returns the gateway WolfNet IP for the most specific configured
+    /// CIDR that contains dest_ip, or None if no CIDR matches.
+    pub fn find_subnet_match(&self, dest_ip: &Ipv4Addr) -> Option<Ipv4Addr> {
+        let dest_u32 = u32::from_be_bytes(dest_ip.octets());
+        let table = self.subnet_routes_cidrs.read().unwrap();
+        for (net, prefix, gw) in table.iter() {
+            // /0 means "match everything" — useful as a default route.
+            // /32 is a single host. Anything in between uses a normal
+            // network mask.
+            let mask: u32 = if *prefix == 0 {
+                0
+            } else if *prefix >= 32 {
+                u32::MAX
+            } else {
+                u32::MAX << (32 - *prefix as u32)
+            };
+            let net_u32 = u32::from_be_bytes(net.octets());
+            if (dest_u32 & mask) == (net_u32 & mask) {
+                return Some(*gw);
+            }
+        }
+        None
+    }
+
     /// Get peer count
     pub fn count(&self) -> usize {
         self.peers_by_ip.read().unwrap().len()
@@ -492,5 +586,153 @@ impl PeerManager {
                 relay_via: p.relay_via.map(|ip| ip.to_string()),
             }
         }).collect()
+    }
+}
+
+#[cfg(test)]
+mod subnet_match_tests {
+    use super::*;
+
+    /// Inject a hand-built CIDR table for testing without touching disk.
+    fn install(pm: &PeerManager, entries: Vec<(&str, u8, &str)>) {
+        let mut parsed: Vec<(Ipv4Addr, u8, Ipv4Addr)> = entries
+            .into_iter()
+            .map(|(net, prefix, gw)| (net.parse().unwrap(), prefix, gw.parse().unwrap()))
+            .collect();
+        parsed.sort_by(|a, b| b.1.cmp(&a.1));
+        *pm.subnet_routes_cidrs.write().unwrap() = parsed;
+    }
+
+    #[test]
+    fn matches_exact_ip_in_slash16() {
+        let pm = PeerManager::new();
+        install(&pm, vec![("10.10.0.0", 16, "10.100.10.30")]);
+        let gw = pm.find_subnet_match(&"10.10.10.10".parse().unwrap());
+        assert_eq!(gw, Some("10.100.10.30".parse().unwrap()));
+    }
+
+    #[test]
+    fn no_match_when_outside_subnet() {
+        let pm = PeerManager::new();
+        install(&pm, vec![("10.10.0.0", 16, "10.100.10.30")]);
+        let gw = pm.find_subnet_match(&"10.11.0.5".parse().unwrap());
+        assert_eq!(gw, None);
+    }
+
+    #[test]
+    fn empty_table_returns_none() {
+        let pm = PeerManager::new();
+        let gw = pm.find_subnet_match(&"10.10.10.10".parse().unwrap());
+        assert_eq!(gw, None);
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        let pm = PeerManager::new();
+        // /16 covers 10.10.0.0/16 → gw A. A more-specific /24 inside it
+        // (10.10.5.0/24) → gw B. Anything in 10.10.5.x must hit B,
+        // anything else in 10.10.x.x must hit A.
+        install(&pm, vec![
+            ("10.10.0.0", 16, "10.100.0.1"),
+            ("10.10.5.0", 24, "10.100.0.2"),
+        ]);
+        assert_eq!(
+            pm.find_subnet_match(&"10.10.5.10".parse().unwrap()),
+            Some("10.100.0.2".parse().unwrap())
+        );
+        assert_eq!(
+            pm.find_subnet_match(&"10.10.99.99".parse().unwrap()),
+            Some("10.100.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn slash_32_exact_host() {
+        let pm = PeerManager::new();
+        install(&pm, vec![("192.168.5.42", 32, "10.100.0.5")]);
+        assert_eq!(
+            pm.find_subnet_match(&"192.168.5.42".parse().unwrap()),
+            Some("10.100.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            pm.find_subnet_match(&"192.168.5.43".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn slash_zero_default_route() {
+        let pm = PeerManager::new();
+        // /0 = match everything. Useful as a full-tunnel default.
+        install(&pm, vec![("0.0.0.0", 0, "10.100.0.99")]);
+        assert_eq!(
+            pm.find_subnet_match(&"8.8.8.8".parse().unwrap()),
+            Some("10.100.0.99".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn slash_24_boundary() {
+        let pm = PeerManager::new();
+        install(&pm, vec![("192.168.1.0", 24, "10.100.0.7")]);
+        assert_eq!(
+            pm.find_subnet_match(&"192.168.1.0".parse().unwrap()),
+            Some("10.100.0.7".parse().unwrap())
+        );
+        assert_eq!(
+            pm.find_subnet_match(&"192.168.1.255".parse().unwrap()),
+            Some("10.100.0.7".parse().unwrap())
+        );
+        assert_eq!(
+            pm.find_subnet_match(&"192.168.2.0".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn loaded_table_is_sorted_longest_first() {
+        // Verifies load_subnet_routes really does sort. Even if the
+        // JSON happens to list /16 before /24, find_subnet_match must
+        // still pick the /24 for IPs inside it.
+        let pm = PeerManager::new();
+        let tmp = std::env::temp_dir().join("wolfnet-subnet-test.json");
+        std::fs::write(
+            &tmp,
+            r#"{"10.10.0.0/16":"10.100.0.1","10.10.5.0/24":"10.100.0.2"}"#,
+        ).unwrap();
+        pm.load_subnet_routes(&tmp);
+        assert_eq!(
+            pm.find_subnet_match(&"10.10.5.5".parse().unwrap()),
+            Some("10.100.0.2".parse().unwrap())
+        );
+        assert_eq!(
+            pm.find_subnet_match(&"10.10.99.5".parse().unwrap()),
+            Some("10.100.0.1".parse().unwrap())
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn missing_file_clears_table() {
+        let pm = PeerManager::new();
+        install(&pm, vec![("10.10.0.0", 16, "10.100.0.1")]);
+        let nonexistent = std::path::PathBuf::from("/tmp/wolfnet-this-file-does-not-exist-zzz.json");
+        pm.load_subnet_routes(&nonexistent);
+        assert_eq!(pm.find_subnet_match(&"10.10.10.10".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn malformed_json_keeps_table() {
+        let pm = PeerManager::new();
+        install(&pm, vec![("10.10.0.0", 16, "10.100.0.1")]);
+        let tmp = std::env::temp_dir().join("wolfnet-subnet-malformed.json");
+        std::fs::write(&tmp, "{ this is not json }").unwrap();
+        pm.load_subnet_routes(&tmp);
+        // Existing table preserved.
+        assert_eq!(
+            pm.find_subnet_match(&"10.10.10.10".parse().unwrap()),
+            Some("10.100.0.1".parse().unwrap())
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
