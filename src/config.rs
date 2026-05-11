@@ -118,6 +118,10 @@ pub struct PeerStatus {
     pub last_seen_secs: u64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// "Tunnel is alive" — at least one signed packet (handshake,
+    /// keepalive, or data) has been observed in the last 120s. Kept
+    /// for back-compat with older readers; prefer `data_flowing` when
+    /// trying to answer "can I actually send a ping to this peer".
     pub connected: bool,
     /// Whether this peer is a gateway node
     #[serde(default)]
@@ -125,7 +129,21 @@ pub struct PeerStatus {
     /// If learned via PEX, the IP of the peer that told us about this one
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_via: Option<String>,
+    /// True iff we've decrypted a real DATA packet from this peer in
+    /// the last 120s — distinct from `connected`, which is also true
+    /// for handshake-only / keepalive-only peers. The asymmetric case
+    /// where `connected=true && data_flowing=false` is the "wolfnet
+    /// status lies" scenario from klasSponsor 2026-05-11 and the only
+    /// reliable signal that data isn't actually getting through.
+    #[serde(default)]
+    pub data_flowing: bool,
+    /// Seconds since we last decrypted a data packet. `u64::MAX` means
+    /// "never since wolfnet started". Symmetric with `last_seen_secs`.
+    #[serde(default = "default_max_u64")]
+    pub last_data_rx_secs: u64,
 }
+
+fn default_max_u64() -> u64 { u64::MAX }
 
 impl Config {
     /// Load configuration from a TOML file

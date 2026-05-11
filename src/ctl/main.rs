@@ -69,7 +69,20 @@ struct PeerStatus {
     relay_via: Option<String>,
     #[serde(default)]
     is_gateway: bool,
+    /// True iff the daemon has decrypted a real data packet from this
+    /// peer in the last 120s. Distinguishes "tunnel handshakes work"
+    /// from "data actually flows". Older daemons that don't emit this
+    /// field deserialize as `false` — the CLI falls back to the legacy
+    /// two-state `connected` display in that case to avoid showing
+    /// every peer as "handshake-only" against an upgraded CLI / older
+    /// daemon combo.
+    #[serde(default)]
+    data_flowing: bool,
+    #[serde(default = "default_max_u64")]
+    last_data_rx_secs: u64,
 }
+
+fn default_max_u64() -> u64 { u64::MAX }
 
 fn main() {
     let cli = Cli::parse();
@@ -105,7 +118,7 @@ fn load_status() -> NodeStatus {
 
 fn cmd_status(status: &NodeStatus) {
     println!();
-    println!("  🐺 WolfNet Status");
+    println!("  WolfNet Status");
     println!("  ─────────────────────────────────────");
     println!("  Hostname:    {}", status.hostname);
     println!("  WolfNet IP:  {}", status.address);
@@ -114,10 +127,29 @@ fn cmd_status(status: &NodeStatus) {
     println!("  Gateway:     {}", if status.gateway { "Yes" } else { "No" });
     println!("  Public Key:  {}...{}", &status.public_key[..8], &status.public_key[status.public_key.len()-4..]);
     println!("  Uptime:      {}", format_duration(status.uptime_secs));
-    println!("  Peers:       {} ({} connected)",
-        status.peers.len(),
-        status.peers.iter().filter(|p| p.connected).count(),
-    );
+    // Three-state peer summary: "online" requires data to actually flow,
+    // not just handshakes. The `handshake-only` bucket is the case that
+    // misled klasSponsor / Fang on 2026-05-11 — surface it distinctly
+    // so the operator can see whether data is reaching this node.
+    //
+    // If the daemon predates the data-flow tracking field (no peer has
+    // ever reported a `last_data_rx_secs`), fall back to the legacy
+    // two-state line so a new CLI talking to an old daemon doesn't lie
+    // by reporting "0 passing data" against a fully-working tunnel.
+    let daemon_reports_data_flow = status.peers.iter()
+        .any(|p| p.last_data_rx_secs != u64::MAX || p.data_flowing);
+    if !daemon_reports_data_flow {
+        println!("  Peers:       {} ({} connected)",
+            status.peers.len(),
+            status.peers.iter().filter(|p| p.connected).count(),
+        );
+    } else {
+        let passing_data    = status.peers.iter().filter(|p| p.data_flowing).count();
+        let handshake_only  = status.peers.iter().filter(|p| p.connected && !p.data_flowing).count();
+        let offline         = status.peers.len() - passing_data - handshake_only;
+        println!("  Peers:       {} ({} passing data, {} handshake-only, {} offline)",
+            status.peers.len(), passing_data, handshake_only, offline);
+    }
     println!();
 }
 
@@ -165,21 +197,34 @@ fn cmd_peers(status: &NodeStatus) {
     }
 
     println!();
-    println!("  🐺 WolfNet Peers");
+    println!("  WolfNet Peers");
     println!("  ─────────────────────────────────────────────────────────────────────");
     println!("  {:<16} {:<16} {:<24} {:<10} {}",
         "HOSTNAME", "WOLFNET IP", "ENDPOINT", "STATUS", "LAST SEEN");
     println!("  ─────────────────────────────────────────────────────────────────────");
 
+    // Fall back to legacy two-state display if the daemon doesn't
+    // surface the data-flow field (older wolfnet builds). Without
+    // this, a new CLI against an old daemon would report every peer
+    // as "handshake-only" even when data is flowing fine.
+    let daemon_reports_data_flow = status.peers.iter()
+        .any(|p| p.last_data_rx_secs != u64::MAX || p.data_flowing);
+
     for peer in &status.peers {
-        let status_str = if peer.connected {
-            "online".to_string()
+        let (status_icon, status_str) = if peer.data_flowing {
+            ("●", "online".to_string())
+        } else if peer.connected && daemon_reports_data_flow {
+            // Handshakes flow but no data — the deception case. ◐
+            // (half-circle) reads as "partial" against ● and ○.
+            ("◐", "handshake-only".to_string())
+        } else if peer.connected {
+            // Older daemon: connected=true, no data_flowing info → treat as online.
+            ("●", "online".to_string())
         } else if peer.relay_via.is_some() {
-            format!("via {}", peer.relay_via.as_deref().unwrap_or("?"))
+            ("◉", format!("via {}", peer.relay_via.as_deref().unwrap_or("?")))
         } else {
-            "offline".to_string()
+            ("○", "offline".to_string())
         };
-        let status_icon = if peer.connected { "●" } else if peer.relay_via.is_some() { "◉" } else { "○" };
         let last_seen = if peer.last_seen_secs == u64::MAX {
             "never".to_string()
         } else {
@@ -207,7 +252,7 @@ fn cmd_info(status: &NodeStatus) {
 
 fn cmd_purge() {
     println!();
-    println!("  🧹 Purging stale peers...");
+    println!("  Purging stale peers...");
     println!();
 
     // Delete routes.json to clear stale route entries

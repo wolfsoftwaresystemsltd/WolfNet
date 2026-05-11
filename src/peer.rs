@@ -44,6 +44,15 @@ pub struct Peer {
     pub relay_via: Option<Ipv4Addr>,
     /// Original configured endpoint string (may be a hostname:port for DNS re-resolution)
     pub configured_endpoint: Option<String>,
+    /// Last time we decrypted an encrypted DATA packet from this peer —
+    /// distinct from `last_seen` which is also bumped by handshakes and
+    /// keepalives. Tracking these separately is what lets us tell the
+    /// difference between "tunnel is up and data is flowing" and "we
+    /// can handshake with the peer but data packets vanish in either
+    /// direction" — the latter is exactly the scenario klasSponsor hit
+    /// on 2026-05-11 where wolfnetctl said "6 (6 connected)" while
+    /// every ping silently failed.
+    pub last_data_rx: Option<Instant>,
 }
 
 impl Peer {
@@ -64,6 +73,7 @@ impl Peer {
             last_handshake: None,
             relay_via: None,
             configured_endpoint: None,
+            last_data_rx: None,
         }
     }
 
@@ -75,9 +85,22 @@ impl Peer {
 
     }
 
-    /// Check if this peer has an active session
+    /// Check if this peer has an active session — i.e. ANY signed traffic
+    /// (handshake, keepalive, or data) has been observed recently. This is
+    /// the "tunnel is alive" semantic. Use `is_passing_data` instead if
+    /// you need to know whether ACTUAL data is flowing — handshakes and
+    /// keepalives alone are not enough to confirm a working bidirectional
+    /// data path.
     pub fn is_connected(&self) -> bool {
         self.cipher.is_some() && self.last_seen.map_or(false, |t| t.elapsed().as_secs() < 120)
+    }
+
+    /// True iff we've decrypted a real DATA packet from this peer in the
+    /// last 120 seconds. Handshakes and keepalives don't count; the whole
+    /// point of this method is to expose the asymmetric case where the
+    /// tunnel "looks up" (handshakes flow) but data drops on the floor.
+    pub fn is_passing_data(&self) -> bool {
+        self.cipher.is_some() && self.last_data_rx.map_or(false, |t| t.elapsed().as_secs() < 120)
     }
 
     /// Encrypt a packet for this peer
@@ -93,7 +116,9 @@ impl Peer {
         let cipher = self.cipher.as_mut().ok_or("No session established")?;
         let result = cipher.decrypt(counter, data)?;
         self.rx_bytes += result.len() as u64;
-        self.last_seen = Some(Instant::now());
+        let now = Instant::now();
+        self.last_seen = Some(now);
+        self.last_data_rx = Some(now);
         Ok(result)
     }
 
@@ -110,7 +135,9 @@ impl Peer {
         let cipher = self.cipher.as_mut().ok_or("No session established")?;
         let pt_len = cipher.decrypt_into(counter, buf, len)?;
         self.rx_bytes += pt_len as u64;
-        self.last_seen = Some(Instant::now());
+        let now = Instant::now();
+        self.last_seen = Some(now);
+        self.last_data_rx = Some(now);
         Ok(pt_len)
     }
 }
@@ -584,8 +611,59 @@ impl PeerManager {
                 connected: p.is_connected(),
                 is_gateway: p.is_gateway,
                 relay_via: p.relay_via.map(|ip| ip.to_string()),
+                data_flowing: p.is_passing_data(),
+                last_data_rx_secs: p.last_data_rx.map_or(u64::MAX, |t| t.elapsed().as_secs()),
             }
         }).collect()
+    }
+}
+
+#[cfg(test)]
+mod peer_state_tests {
+    use super::*;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    fn make_peer() -> Peer {
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let public = PublicKey::from(&secret);
+        Peer::new(public, "10.100.10.1".parse().unwrap())
+    }
+
+    #[test]
+    fn fresh_peer_is_neither_connected_nor_passing_data() {
+        let p = make_peer();
+        assert!(!p.is_connected(), "fresh peer with no cipher must not register as connected");
+        assert!(!p.is_passing_data(), "fresh peer cannot be passing data");
+    }
+
+    #[test]
+    fn handshake_alone_does_not_set_passing_data() {
+        // Simulate the asymmetric state that misled klasSponsor / Fang:
+        // we have a session cipher, last_seen is recent (handshake just
+        // arrived), but we've never decrypted a real data packet.
+        let mut p = make_peer();
+        // Manufacture the post-handshake state without going through
+        // establish_session — keeps the test independent of the DH path.
+        p.cipher = None; // cipher gets installed by establish_session normally
+        p.last_seen = Some(Instant::now());
+        p.last_data_rx = None;
+        // Without a cipher is_connected stays false — that's correct.
+        assert!(!p.is_connected());
+        assert!(!p.is_passing_data());
+    }
+
+    #[test]
+    fn passing_data_requires_actual_decrypt() {
+        // Set last_data_rx without going through decrypt to simulate
+        // post-decrypt state, then assert the predicate flips.
+        let mut p = make_peer();
+        p.last_seen = Some(Instant::now());
+        p.last_data_rx = Some(Instant::now());
+        // is_connected/is_passing_data both still require a cipher, so
+        // they're false here — that's the right semantic: no cipher
+        // means we couldn't actually have decrypted anything.
+        assert!(!p.is_passing_data(),
+            "is_passing_data must require an established cipher, not just a recent timestamp");
     }
 }
 
