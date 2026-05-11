@@ -66,7 +66,7 @@ pub fn enable_gateway(wolfnet_interface: &str, subnet: &str) -> Result<(), Box<d
         warn!("iptables FORWARD rule (in) may have failed");
     }
 
-    // Removed in 0.5.18: an `-A INPUT -i <ext> -d <subnet> -j DROP` rule
+    // Removed in v20.11.9: an `-A INPUT -i <ext> -d <subnet> -j DROP` rule
     // used to live here under the banner "Block all other inbound traffic
     // to wolfnet (truly private)". klasSponsor (2026-04-27) confirmed it
     // was breaking WolfRouter subnet routing on multiple nodes — peers'

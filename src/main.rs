@@ -944,17 +944,34 @@ fn run_daemon(config_path: &PathBuf) {
                                     Err(e) => { warn!("Reload: invalid peer IP '{}': {}", pc.allowed_ip, e); continue; }
                                 };
                                 if existing_ips.contains(&ip) {
-                                    // Update existing peer's endpoint and hostname if changed
-                                    if let Some(ref ep) = pc.endpoint {
-                                        if let Some(addr) = resolve_endpoint(ep) {
-                                            let current_ep = peer_manager.with_peer_by_ip(&ip, |peer| peer.endpoint).flatten();
-                                            if current_ep != Some(addr) {
-                                                info!("Reload: updated endpoint for {} -> {}", ip, addr);
-                                                peer_manager.update_endpoint(&ip, addr);
-                                                // Also update configured_endpoint for DNS re-resolution
-                                                peer_manager.with_peer_by_ip(&ip, |peer| {
-                                                    peer.configured_endpoint = Some(ep.clone());
-                                                });
+                                    // Update existing peer's endpoint and hostname if changed.
+                                    //
+                                    // Three cases for `pc.endpoint`:
+                                    //   * Some(ep) → set/refresh the in-memory endpoint.
+                                    //   * None, but in-memory has one → operator (or
+                                    //     WolfStack cluster-sync) intentionally removed
+                                    //     the endpoint line so the peer runs roaming-only.
+                                    //     We must WIPE the in-memory endpoint, otherwise
+                                    //     the daemon keeps dialing the old address and
+                                    //     every roaming-learned update gets clobbered.
+                                    //   * None, in-memory also None → no-op.
+                                    match pc.endpoint.as_ref() {
+                                        Some(ep) => {
+                                            if let Some(addr) = resolve_endpoint(ep) {
+                                                let current_ep = peer_manager.with_peer_by_ip(&ip, |peer| peer.endpoint).flatten();
+                                                if current_ep != Some(addr) {
+                                                    info!("Reload: updated endpoint for {} -> {}", ip, addr);
+                                                    peer_manager.update_endpoint(&ip, addr);
+                                                    peer_manager.with_peer_by_ip(&ip, |peer| {
+                                                        peer.configured_endpoint = Some(ep.clone());
+                                                    });
+                                                    updated += 1;
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            if peer_manager.clear_endpoint(&ip) {
+                                                info!("Reload: cleared endpoint for {} (roaming-only)", ip);
                                                 updated += 1;
                                             }
                                         }

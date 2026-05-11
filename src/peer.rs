@@ -259,6 +259,27 @@ impl PeerManager {
         }
     }
 
+    /// Forget a peer's static endpoint — used when a SIGHUP config reload
+    /// finds the peer no longer has an `endpoint = ...` line. Without
+    /// this, the previously-pinned endpoint persists in memory and
+    /// roaming-learned updates never stick because there's still a
+    /// configured target to dial. Also clears `configured_endpoint` so
+    /// the DynDNS re-resolve loop stops re-installing the old address.
+    /// Returns true if anything was actually cleared (caller can use
+    /// this to log a reload-changed counter).
+    pub fn clear_endpoint(&self, ip: &Ipv4Addr) -> bool {
+        let mut peers = self.peers_by_ip.write().unwrap();
+        if let Some(peer) = peers.get_mut(ip) {
+            let had_endpoint = peer.endpoint.is_some() || peer.configured_endpoint.is_some();
+            if let Some(old) = peer.endpoint.take() {
+                self.endpoint_to_ip.write().unwrap().remove(&old);
+            }
+            peer.configured_endpoint = None;
+            return had_endpoint;
+        }
+        false
+    }
+
     /// Update a peer's endpoint and hostname from discovery
     pub fn update_from_discovery(&self, public_key: &PublicKey, endpoint: SocketAddr, wolfnet_ip: Ipv4Addr, hostname: &str, is_gateway: bool) {
         let mut peers = self.peers_by_ip.write().unwrap();
