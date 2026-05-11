@@ -259,8 +259,8 @@ fn cmd_purge() {
     let routes_path = "/var/run/wolfnet/routes.json";
     if std::path::Path::new(routes_path).exists() {
         match std::fs::remove_file(routes_path) {
-            Ok(_) => println!("  ✓ Deleted {}", routes_path),
-            Err(e) => println!("  ✗ Could not delete {}: {}", routes_path, e),
+            Ok(_) => println!("  Deleted {}", routes_path),
+            Err(e) => println!("  Could not delete {}: {}", routes_path, e),
         }
     }
 
@@ -278,16 +278,16 @@ fn cmd_purge() {
                     .status()
                 {
                     Ok(s) if s.success() => {
-                        println!("  ✓ Sent SIGHUP to wolfnet (PID {})", pid);
+                        println!("  Sent SIGHUP to wolfnet (PID {})", pid);
                         println!("    Daemon will reload config and remove peers not in config.toml");
                     }
-                    _ => println!("  ✗ Failed to send SIGHUP to PID {}", pid),
+                    _ => println!("  Failed to send SIGHUP to PID {}", pid),
                 }
             } else {
-                println!("  ✗ WolfNet daemon not found — is it running?");
+                println!("  WolfNet daemon not found — is it running?");
             }
         }
-        _ => println!("  ✗ WolfNet daemon not found — is it running?"),
+        _ => println!("  WolfNet daemon not found — is it running?"),
     }
 
     println!();
