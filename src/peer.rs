@@ -168,6 +168,45 @@ pub struct PeerManager {
     purged_ips: Arc<RwLock<std::collections::HashSet<Ipv4Addr>>>,
 }
 
+/// Is this address useful as a peer endpoint we might actually dial?
+///
+/// Returns `false` for IPv4 RFC1918 (10/8, 172.16/12, 192.168/16),
+/// loopback (127/8), link-local (169.254/16), unspecified (0.0.0.0),
+/// and multicast (224/4). These are never legitimate cross-internet
+/// peer endpoints — a wolfnet daemon receiving a PEX entry that
+/// carries such an address can't reach it (unless coincidentally on
+/// the same LAN, in which case roaming + broadcast discovery cover
+/// the connection already). Storing it pollutes the peer table and
+/// makes the daemon waste handshake UDP into the void.
+///
+/// IPv6 endpoints are passed through unchanged (the broader codebase
+/// is IPv4-focused; revisit when IPv6 support lands).
+///
+/// klasSponsor 2026-05-12 architectural point: "Wolfnet should not
+/// use internal ip for connection unless it's a relay." That maps to
+/// stripping such endpoints from outgoing PEX (we don't poison
+/// downstream peers) and ignoring them on incoming PEX (we don't
+/// poison ourselves). The peer-relay routing still works because
+/// PEX-learned peers carry `relay_via = sender_ip` regardless of
+/// what we do with the endpoint field.
+pub fn is_routable_endpoint(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            if v4.is_loopback() { return false; }
+            if v4.is_unspecified() { return false; }
+            if v4.is_link_local() { return false; }
+            if v4.is_multicast() { return false; }
+            // RFC1918
+            if oct[0] == 10 { return false; }
+            if oct[0] == 172 && (16..=31).contains(&oct[1]) { return false; }
+            if oct[0] == 192 && oct[1] == 168 { return false; }
+            true
+        }
+        std::net::IpAddr::V6(_) => true, // IPv6 passthrough — wolfnet is IPv4-focused today
+    }
+}
+
 impl PeerManager {
     pub fn new() -> Self {
         Self {
@@ -507,16 +546,34 @@ impl PeerManager {
     }
 
     /// Build PEX entries for all known peers (to share with others)
-    /// Excludes the requesting peer's own IP and our own IP
+    /// Excludes the requesting peer's own IP and our own IP.
+    ///
+    /// Endpoints that aren't reachable from outside the originating
+    /// LAN are STRIPPED from the outgoing PEX entries — see
+    /// `is_routable_endpoint`. klasSponsor 2026-05-12 (separate
+    /// architectural point from the wolfstack-side tombstone fix
+    /// shipped in 22.14.11): "Wolfnet should not use internal ip for
+    /// connection unless it's a relay." A peer behind NAT advertising
+    /// its endpoint as `10.10.10.30:9630` poisoned every public-side
+    /// receiver that processed the PEX — receivers stored the
+    /// unreachable RFC1918 address as the peer's endpoint and wolfnet
+    /// then sent handshake UDP into the void on every retry. Since
+    /// PEX-learned peers are stored with `relay_via = sender_ip`
+    /// anyway, the endpoint field is not used for routing in the
+    /// common case; dropping it costs us nothing while preventing the
+    /// poison.
     pub fn get_pex_entries(&self, my_ip: Ipv4Addr) -> Vec<PexEntry> {
         let peers = self.peers_by_ip.read().unwrap();
         peers.values()
             .filter(|p| p.wolfnet_ip != my_ip)
             .map(|p| {
+                let endpoint = p.endpoint.and_then(|e| {
+                    if is_routable_endpoint(e) { Some(e.to_string()) } else { None }
+                });
                 PexEntry {
                     public_key: BASE64.encode(p.public_key.as_bytes()),
                     wolfnet_ip: p.wolfnet_ip.to_string(),
-                    endpoint: p.endpoint.map(|e| e.to_string()),
+                    endpoint,
                     hostname: p.hostname.clone(),
                     is_gateway: p.is_gateway,
                 }
@@ -599,11 +656,22 @@ impl PeerManager {
             peer.is_gateway = entry.is_gateway;
             peer.relay_via = Some(sender_ip);
 
-            // Parse endpoint if available
+            // Parse endpoint if available — and only store it if it's
+            // routable (public IPv4, not RFC1918 / loopback /
+            // link-local / multicast). Older wolfnet versions (≤0.5.22)
+            // happily stored an RFC1918 endpoint received via PEX, then
+            // the daemon would keep dialing the unreachable address on
+            // every handshake retry — klasSponsor's traffic flood was
+            // partly driven by this. The peer entry itself is still
+            // added with relay_via = sender_ip (set above), so
+            // connectivity works via the relay; we just don't try to
+            // contact the peer directly on an address we can't reach.
             if let Some(ref ep_str) = entry.endpoint {
                 if let Ok(ep) = ep_str.parse::<SocketAddr>() {
-                    peer.endpoint = Some(ep);
-                    self.endpoint_to_ip.write().unwrap().insert(ep, entry_ip);
+                    if is_routable_endpoint(ep) {
+                        peer.endpoint = Some(ep);
+                        self.endpoint_to_ip.write().unwrap().insert(ep, entry_ip);
+                    }
                 }
             }
 
@@ -833,5 +901,136 @@ mod subnet_match_tests {
             Some("10.100.0.1".parse().unwrap())
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod pex_endpoint_filter_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn sa(s: &str) -> SocketAddr { s.parse().unwrap() }
+
+    // ─── is_routable_endpoint classifier ───
+    #[test]
+    fn routable_public_ipv4_passes() {
+        assert!(is_routable_endpoint(sa("194.104.94.40:9600")));
+        assert!(is_routable_endpoint(sa("8.8.8.8:53")));
+        assert!(is_routable_endpoint(sa("185.57.4.152:9620")));
+    }
+
+    #[test]
+    fn rfc1918_ten_dot_blocked() {
+        assert!(!is_routable_endpoint(sa("10.0.0.1:9600")));
+        assert!(!is_routable_endpoint(sa("10.10.10.30:9630")));
+        assert!(!is_routable_endpoint(sa("10.255.255.255:9600")));
+    }
+
+    #[test]
+    fn rfc1918_172_dot_blocked() {
+        assert!(!is_routable_endpoint(sa("172.16.0.1:9600")));
+        assert!(!is_routable_endpoint(sa("172.31.255.254:9600")));
+        // Boundary: 172.15 and 172.32 are NOT RFC1918.
+        assert!(is_routable_endpoint(sa("172.15.0.1:9600")));
+        assert!(is_routable_endpoint(sa("172.32.0.1:9600")));
+    }
+
+    #[test]
+    fn rfc1918_192_168_blocked() {
+        assert!(!is_routable_endpoint(sa("192.168.0.1:9600")));
+        assert!(!is_routable_endpoint(sa("192.168.255.254:9600")));
+        // Boundary: 192.167 and 192.169 are NOT RFC1918.
+        assert!(is_routable_endpoint(sa("192.167.0.1:9600")));
+        assert!(is_routable_endpoint(sa("192.169.0.1:9600")));
+    }
+
+    #[test]
+    fn loopback_blocked() {
+        assert!(!is_routable_endpoint(sa("127.0.0.1:9600")));
+        assert!(!is_routable_endpoint(sa("127.255.255.254:9600")));
+    }
+
+    #[test]
+    fn link_local_blocked() {
+        assert!(!is_routable_endpoint(sa("169.254.1.1:9600")));
+        assert!(!is_routable_endpoint(sa("169.254.169.254:80"))); // canonical metadata IP
+    }
+
+    #[test]
+    fn multicast_blocked() {
+        assert!(!is_routable_endpoint(sa("224.0.0.1:9600")));
+        assert!(!is_routable_endpoint(sa("239.255.255.255:9600")));
+    }
+
+    #[test]
+    fn unspecified_blocked() {
+        assert!(!is_routable_endpoint(sa("0.0.0.0:9600")));
+    }
+
+    // ─── PEX filter integration ───
+    // Add a peer with an RFC1918 endpoint, build PEX entries, confirm
+    // the endpoint is stripped on the way out.
+    #[test]
+    fn outgoing_pex_strips_rfc1918_endpoint() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let pm = PeerManager::new();
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let public = PublicKey::from(&secret);
+        let mut peer = Peer::new(public, "10.100.10.30".parse().unwrap());
+        peer.hostname = "ninni".into();
+        peer.endpoint = Some(sa("10.10.10.30:9630")); // RFC1918, must be stripped
+        pm.add_peer(peer);
+
+        let entries = pm.get_pex_entries("10.100.10.40".parse().unwrap());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hostname, "ninni");
+        assert!(entries[0].endpoint.is_none(),
+            "PEX must strip RFC1918 endpoint; got {:?}", entries[0].endpoint);
+    }
+
+    #[test]
+    fn outgoing_pex_preserves_public_endpoint() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let pm = PeerManager::new();
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let public = PublicKey::from(&secret);
+        let mut peer = Peer::new(public, "10.100.10.40".parse().unwrap());
+        peer.hostname = "vps".into();
+        peer.endpoint = Some(sa("194.104.94.40:9600"));
+        pm.add_peer(peer);
+
+        let entries = pm.get_pex_entries("10.100.10.20".parse().unwrap());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].endpoint.as_deref(), Some("194.104.94.40:9600"));
+    }
+
+    #[test]
+    fn outgoing_pex_strips_loopback_endpoint() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let pm = PeerManager::new();
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let public = PublicKey::from(&secret);
+        let mut peer = Peer::new(public, "10.100.10.50".parse().unwrap());
+        peer.endpoint = Some(sa("127.0.0.1:9600"));
+        pm.add_peer(peer);
+
+        let entries = pm.get_pex_entries("10.100.10.40".parse().unwrap());
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].endpoint.is_none());
+    }
+
+    #[test]
+    fn outgoing_pex_excludes_self() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let pm = PeerManager::new();
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let public = PublicKey::from(&secret);
+        let mut peer = Peer::new(public, "10.100.10.40".parse().unwrap());
+        peer.endpoint = Some(sa("194.104.94.40:9600"));
+        pm.add_peer(peer);
+
+        // Asking for entries as if we WERE 10.100.10.40 should exclude self.
+        let entries = pm.get_pex_entries("10.100.10.40".parse().unwrap());
+        assert_eq!(entries.len(), 0);
     }
 }
