@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # WolfNet Quick Install Script
-# Installs WolfNet on Ubuntu/Debian (apt) or Fedora/RHEL (dnf)
+# Installs WolfNet on Ubuntu/Debian (apt), Fedora/RHEL (dnf/yum),
+# Arch/Manjaro/CachyOS (pacman), openSUSE (zypper), or Alpine (apk)
 #
 # Usage: curl -sSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/WolfNet/main/setup.sh | sudo bash
 #
@@ -89,7 +90,19 @@ if [ -n "$BINARY_ARCH" ]; then
 fi
 
 # Detect package manager
-if command -v apt &> /dev/null; then
+# Order matters: pacman/zypper/apk are checked BEFORE apt because some
+# minimal Arch / openSUSE images ship a stub apt for compatibility — the
+# distro-native manager is what we actually want.
+if command -v pacman &> /dev/null; then
+    PKG_MANAGER="pacman"
+    echo "✓ Detected Arch/Manjaro/CachyOS (pacman)"
+elif command -v zypper &> /dev/null; then
+    PKG_MANAGER="zypper"
+    echo "✓ Detected openSUSE (zypper)"
+elif command -v apk &> /dev/null; then
+    PKG_MANAGER="apk"
+    echo "✓ Detected Alpine (apk)"
+elif command -v apt &> /dev/null; then
     PKG_MANAGER="apt"
     echo "✓ Detected Debian/Ubuntu (apt)"
 elif command -v dnf &> /dev/null; then
@@ -99,7 +112,7 @@ elif command -v yum &> /dev/null; then
     PKG_MANAGER="yum"
     echo "✓ Detected RHEL/CentOS (yum)"
 else
-    echo "✗ Could not detect package manager (apt/dnf/yum)"
+    echo "✗ Could not detect package manager (apt/dnf/yum/pacman/zypper/apk)"
     echo "  Please install dependencies manually."
     exit 1
 fi
@@ -118,6 +131,14 @@ if [ "$PREBUILT_OK" = "false" ]; then
         dnf install -y git curl gcc gcc-c++ make openssl-devel pkg-config
     elif [ "$PKG_MANAGER" = "yum" ]; then
         yum install -y git curl gcc gcc-c++ make openssl-devel pkgconfig
+    elif [ "$PKG_MANAGER" = "pacman" ]; then
+        # --needed skips already-installed packages; base-devel is a group
+        # that pulls in gcc/make/binutils/etc. pkgconf provides pkg-config.
+        pacman -Sy --needed --noconfirm git curl base-devel pkgconf openssl
+    elif [ "$PKG_MANAGER" = "zypper" ]; then
+        zypper --non-interactive install git curl gcc gcc-c++ make libopenssl-devel pkg-config
+    elif [ "$PKG_MANAGER" = "apk" ]; then
+        apk add --no-cache git curl build-base pkgconf openssl-dev
     fi
 
     echo "✓ System dependencies installed"
